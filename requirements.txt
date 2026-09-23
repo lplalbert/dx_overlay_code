@@ -1,0 +1,12 @@
+# Runtime dependencies for:
+#   config.txt -> rs_gen_Syn_template_nums_dual.py -> wm_imgs -> dx_overlay.exe
+
+numpy
+opencv-python
+reedsolo
+
+# Release packaging dependency used by build_release.bat:
+pyinstaller
+
+# Alternative slim generator dependency:
+galois

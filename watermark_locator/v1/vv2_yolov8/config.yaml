@@ -1,0 +1,28 @@
+# v1-vv2: 独立识别 + YOLOv8 检测
+# 多数据集训练配置
+
+# 数据集根目录 (下所有子目录的 train/val 会被自动发现)
+data_root: /data1/lpl/datasets
+
+# 图像尺寸
+image_height: 1080
+image_width: 1920
+
+# 输出目录
+output_dir: output/v1_vv2_yolo
+
+# YOLO 模型
+model: yolov8n.pt
+imgsz: 1080
+
+# 训练参数
+batch_size: 8
+lr: 0.01
+epochs: 100
+
+# 噪声配置 (记录用, 实际噪声在数据集生成时应用)
+noise_config:
+  train_noise:
+    - type: "pair"
+      weight: 1.0
+  val_noise: "none"

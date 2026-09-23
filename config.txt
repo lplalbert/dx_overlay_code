@@ -1,0 +1,37 @@
+# DX Overlay - essential configuration
+# Invalid values are logged and replaced with safe defaults.
+
+# Independent runtime strengths: 0.0 disables that channel, 1.0 is fully opaque.
+# Static template is carried by Cb and remains unchanged across Present frames.
+static_alpha=0.05
+# Dynamic template is carried by Cr and alternates with the texture phase.
+dynamic_alpha=0.05
+# Legacy compatibility: alpha=VALUE may still be used as a fallback for both.
+
+# Target monitor: 0=primary, 1+=other monitor, -1=span all monitors
+monitor_index=0
+
+# Target physical display refreshes to hold each positive/inverse texture
+switch_hold_frames=1
+
+# Target display-refresh intervals used for the switch: 1=hard switch
+transition_frames=1
+
+# Watermark identity: -1=reuse existing templates, 0-1048575=generate
+watermark_id=123456
+
+# Watermark layout
+block_rows=4
+block_cols=6
+# Generator chroma amplitudes (independent from the runtime alpha values above)
+dynamic_ratio_cr=10
+static_ratio_cb=8
+
+# Static Cb shape (dynamic Cr remains rectangular): gaussian, gaussian_v2, soft_rect, or rect
+pattern=rect
+
+# Generator selection: auto, packed_exe, rs_script, or slim_script
+generator_mode=auto
+
+# Python executable used when the packed generator is unavailable
+python_path=python

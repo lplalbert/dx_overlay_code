@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# 编译产物
+dx_overlay.exe
+*.obj
+*.o
+*.exe
+
+# 生成的数据 / 调试图片
+wm_imgs/
+watermark_locator/dataset/vis/
+watermark_locator/dataset/vis_output/
+watermark_locator/dataset/data/
+watermark_locator/dataset/data_test/
+watermark_locator/dataset/data_test2/
+watermark_locator/pattern_vis/
+frame_test_log.txt
+
+# 个人文件
+8A5553D0-*.png
+
+# 重复的 requirements
+requirement.txt
+
+# 第三方库 (clone 的 git 仓库, 不纳入版本管理)
+yolo/
+**/ultralytics/.git/
+**/unet/.git/
+watermark_locator/v1/vv2_yolov8/ultralytics/
+watermark_locator/v2/vv2_yolov8/ultralytics/
+
+# 探索性调试脚本
+watermark_locator/compare_detail.py
+watermark_locator/compare_rect.py
+watermark_locator/compare_templates.py
+watermark_locator/design_locator.py
+watermark_locator/design_rect_locator.py
+watermark_locator/show_candidates.py
+watermark_locator/visualize_patterns.py
+watermark_locator/dataset.py
+watermark_locator/v2/compare_layouts.py
+watermark_locator/v2/visualize_template.py
+watermark_locator/v2/*.png
+
+# IDE / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 训练输出
+output/
+runs/
+wandb/
