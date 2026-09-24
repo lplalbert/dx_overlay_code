@@ -9,28 +9,26 @@ dx_overlay_code/
 ├── C++ 水印叠加引擎          main.cpp, overlay*.cpp/h
 ├── 水印编码生成              generate_yellow_white_template.py
 │                             rs_gen_Syn_template_nums_dual.py
-│                             wm_generator_slim.py
 ├── 噪声模型                  physical_moire.py, wechat_worst_case_compressor.py
-└── watermark_locator/        检测模型 (v1 独立 / v2 联合 × vv1 U-Net / vv2 YOLOv8)
+├── vis/                      可视化输出
+└── watermark_locator/        检测模型 (v1 独立识别 × vv1 U-Net / vv2 YOLOv8)
     ├── dataset/              合成数据集生成
     ├── generate_locator_pattern.py
     ├── utils.py
-    ├── v1/                   独立识别
-    │   ├── vv1_unet/         U-Net 语义分割
-    │   └── vv2_yolov8/       YOLOv8 目标检测
-    └── v2/                   联合识别
-        ├── vv1_unet/
-        └── vv2_yolov8/
+    └── v1/                   独立识别
+        ├── vv1_unet/         U-Net 语义分割
+        └── vv2_yolov8/       YOLOv8 目标检测
 ```
 
 ## 编码方案
 
 - **RS(15,5)** 纠错编码, GF(2^4)
-- **棋盘格网格**: 4行×6列 = 24 块, 其中 6 块为定位块
+- **块网格**: 4行×6列 = 24 块, 其中 6 块为定位块 (回字形同心方环)
 - **斜条纹调制**: 45° 方向, 周期 4px, 宽度 2px — 仅作用于"黄色"(信号)单元格
-- **双嵌入域** (`channel_mode`):
-  - `b` — RGB B 通道 (黄/白, 对应 `generate_yellow_white_template.py`)
-  - `cb` — YCbCr Cb/Cr 通道 (对应 HLSL shader)
+- **嵌入域** (`channel_mode`): `b` / `yw` — 黄/白 RGB (对应 `generate_yellow_white_template.py`)
+  - 模板**只含 0 和 255**: 黄(信号)=(B,G,R)=(0,255,255), 白(中性)=(255,255,255)
+  - 按 α 融合: `out = α_eff·template + (1-α_eff)·carrier`, `α_eff = α·dynamicMask`
+  - 白像素 `dynamicMask=0` 完全不改; 黄像素 `max|Δ| = α×255` (α=0.032 → 8.16)
 
 ## 快速开始
 
@@ -39,13 +37,15 @@ dx_overlay_code/
 ```bash
 cd watermark_locator/dataset
 
-# B 通道嵌入
+# 多数据集 clean/noisy 双树 (推荐)
+python prepare_multids.py --data_root /data1/lpl/datasets \
+    --output_root /data1/lpl/datasets_labeled \
+    --dataset_counts coco_minator_dataset=2000,document_ds=2000,bcgd=0 \
+    --alpha 0.032 --channel_mode b --stage both --wechat_preset mainstream_worst
+
+# 单批生成
 python generate_dataset.py --num_samples 1000 --output_dir ./data \
     --channel_mode b --carrier_path /path/to/carrier.png
-
-# Cb 通道嵌入
-python generate_dataset.py --num_samples 1000 --output_dir ./data \
-    --channel_mode cb --carrier_dir /path/to/carriers/
 ```
 
 ### 训练 (U-Net)
@@ -77,8 +77,8 @@ python generate_yellow_white_template.py --id 123456 \
 |---|---|---|
 | `identity` | 无 | — |
 | `wechat` | 无 (JPEG 压缩) | 不变 |
-| `tile_crop` | 3×3 平铺+随机裁剪 | warpAffine |
-| `pimog` | 透视(±30px)+光照+摩尔纹+高斯 | warpPerspective |
+| `tile_crop` | 3×3 平铺+随机旋转(±5°)+随机裁剪 | warpAffine |
+| `pimog` | 透视(3%–7%)+畸变+光照+摩尔纹 | warp |
 
 ## 依赖
 

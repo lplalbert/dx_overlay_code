@@ -1,0 +1,27 @@
+# 冒烟: 两阶段各 1 epoch, 小样本, 验证 clean→noisy 数据能接到训练脚本上
+stages:
+  - name: clean_pretrain
+    data_root: /data1/lpl/datasets_labeled/clean
+    epochs: 1
+    lr: 0.01
+    patience: 0
+  - name: noisy_finetune
+    data_root: /data1/lpl/datasets_labeled/noisy
+    epochs: 1
+    lr: 0.005
+    patience: 0
+
+data_root: /data1/lpl/datasets_labeled/noisy
+image_height: 1080
+image_width: 1920
+output_dir: output/smoke_vv2
+model: yolov8n.pt
+imgsz: 640
+batch_size: 4
+lr: 0.01
+epochs: 1
+patience: 0
+save_every: 1
+seed: 42
+train_length: 24
+val_length: 8

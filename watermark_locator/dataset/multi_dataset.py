@@ -34,12 +34,18 @@ IMAGE_EXTS = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff')
 
 def discover_datasets(root_dir):
     """
-    扫描 root_dir 下所有子目录，返回 [{name, train_images, train_labels, val_images, val_labels}, ...]
+    扫描 root_dir 下所有子目录，返回:
+        [{name,
+          train_images, train_masks, train_labels,
+          val_images,   val_masks,   val_labels}, ...]
+
+    masks/ 供 vv1 分割, labels/ 供 vv2 检测; 两者可同时存在, 也可都缺(纯载体)。
 
     自动适配以下布局:
-        root/ds/train/images/ + root/ds/train/masks|labels/
-        root/ds/train/ (直接放图片和标注)
-        root/ds/train_images/ + root/ds/train_masks|labels/
+        root/ds/train/images/ + root/ds/train/masks/ + root/ds/train/labels/
+        root/ds/train/ (直接放图片) + root/ds/train_masks|labels/
+        root/ds/train_images/ + root/ds/train_masks| + root/ds/train_labels/
+        root/ds/images/ + root/ds/masks/ + root/ds/labels/ (单 split)
     """
     datasets = []
     if not os.path.isdir(root_dir):
@@ -54,11 +60,12 @@ def discover_datasets(root_dir):
         info = {'name': entry}
 
         for split in ('train', 'val'):
-            images_dir, labels_dir = _find_split_dirs(ds_path, split)
+            images_dir, masks_dir, labels_dir = _find_split_dirs(ds_path, split)
             if images_dir is None:
                 logger.warning(f"  [{entry}/{split}] no images dir found, skipping")
                 continue
             info[f'{split}_images'] = images_dir
+            info[f'{split}_masks'] = masks_dir
             info[f'{split}_labels'] = labels_dir
 
         if 'train_images' in info:
@@ -66,7 +73,8 @@ def discover_datasets(root_dir):
             n_train = len(_list_images(info['train_images']))
             n_val = len(_list_images(info.get('val_images', '')))
             logger.info(f"  [{entry}] train={n_train}, val={n_val}, "
-                       f"labels={info.get('train_labels', 'N/A')}")
+                       f"masks={info.get('train_masks') or 'N/A'}, "
+                       f"labels={info.get('train_labels') or 'N/A'}")
         else:
             logger.warning(f"  [{entry}] no train split found, skipping")
 
@@ -74,34 +82,37 @@ def discover_datasets(root_dir):
 
 
 def _find_split_dirs(ds_path, split):
-    """查找 split (train/val) 的 images 和 labels 目录。"""
+    """查找 split (train/val) 的 images / masks / labels 目录。
+
+    Returns:
+        (images_dir, masks_dir, labels_dir) — 缺失项为 None。
+    """
     candidates = [
-        # ds/train/images + ds/train/masks|labels
+        # ds/train/images + ds/train/masks + ds/train/labels
         (os.path.join(ds_path, split, 'images'),
-         [os.path.join(ds_path, split, 'masks'),
-          os.path.join(ds_path, split, 'labels')]),
-        # ds/train (直接放图片) + ds/train_masks|labels
+         os.path.join(ds_path, split, 'masks'),
+         os.path.join(ds_path, split, 'labels')),
+        # ds/train (直接放图片) + ds/train_masks + ds/train_labels
         (os.path.join(ds_path, split),
-         [os.path.join(ds_path, f'{split}_masks'),
-          os.path.join(ds_path, f'{split}_labels')]),
-        # ds/train_images + ds/train_masks|labels
+         os.path.join(ds_path, f'{split}_masks'),
+         os.path.join(ds_path, f'{split}_labels')),
+        # ds/train_images + ds/train_masks + ds/train_labels
         (os.path.join(ds_path, f'{split}_images'),
-         [os.path.join(ds_path, f'{split}_masks'),
-          os.path.join(ds_path, f'{split}_labels')]),
-        # ds/images + ds/masks (单 split)
+         os.path.join(ds_path, f'{split}_masks'),
+         os.path.join(ds_path, f'{split}_labels')),
+        # ds/images + ds/masks + ds/labels (单 split)
         (os.path.join(ds_path, 'images'),
-         [os.path.join(ds_path, 'masks'),
-          os.path.join(ds_path, 'labels')]),
+         os.path.join(ds_path, 'masks'),
+         os.path.join(ds_path, 'labels')),
     ]
 
-    for img_dir, lbl_dirs in candidates:
+    for img_dir, msk_dir, lbl_dir in candidates:
         if os.path.isdir(img_dir) and _list_images(img_dir):
-            for lbl_dir in lbl_dirs:
-                if os.path.isdir(lbl_dir):
-                    return img_dir, lbl_dir
-            return img_dir, None  # 有图片无标注 (推理用)
+            return (img_dir,
+                    msk_dir if os.path.isdir(msk_dir) else None,
+                    lbl_dir if os.path.isdir(lbl_dir) else None)
 
-    return None, None
+    return None, None, None
 
 
 def _list_images(directory):
@@ -114,13 +125,20 @@ def _list_images(directory):
 
 
 class LocatorSegmentationDataset(Dataset):
-    """v1-vv1: Cb通道 → mask 分割数据集 (单个数据源)。"""
+    """v1-vv1: 3 通道 BGR → mask 分割数据集 (单个数据源)。
+
+    输入是完整 BGR 三通道 — 水印模板的信号只写在 B 通道 (黄 B=0 / 白 B=255,
+    G/R 恒 255), 所以 channel 0 就是水印所在通道。**不要**再抽 Cb。
+    """
 
     def __init__(self, images_dir, masks_dir, image_size=(1080, 1920)):
         self.images_dir = images_dir
         self.masks_dir = masks_dir
         self.image_size = image_size
         self.files = _list_images(images_dir)
+        if masks_dir is None and self.files:
+            logger.warning(f"  SegmentationDataset: no masks dir for {images_dir} "
+                           f"-> all targets will be EMPTY (pure negatives)")
         logger.info(f"  SegmentationDataset: {len(self.files)} images from {images_dir}")
 
     def __len__(self):
@@ -144,17 +162,20 @@ class LocatorSegmentationDataset(Dataset):
         if mask.shape[:2] != (h, w):
             mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
 
-        # Cb通道
-        ycrcb = cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb)
-        cb = ycrcb[:, :, 2].astype(np.float32) / 255.0
+        # 3 通道 BGR (channel 0 = B = 水印信号所在通道)
+        if img.ndim == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        img = img.astype(np.float32) / 255.0
 
         mask = (mask > 127).astype(np.float32)
 
-        image_t = torch.from_numpy(cb).unsqueeze(0)   # (1, H, W)
-        mask_t = torch.from_numpy(mask).unsqueeze(0)   # (1, H, W)
+        image_t = torch.from_numpy(img.transpose(2, 0, 1))   # (3, H, W) BGR
+        mask_t = torch.from_numpy(mask).unsqueeze(0)         # (1, H, W)
         return image_t, mask_t
 
     def _load_mask(self, image_name):
+        if self.masks_dir is None:
+            return None
         stem = os.path.splitext(image_name)[0]
         for ext in ('.png', '.jpg', '.jpeg', '.bmp'):
             for suffix in ('', '_mask', '_label'):
@@ -165,8 +186,9 @@ class LocatorSegmentationDataset(Dataset):
 
 
 class LocatorDetectionDataset(Dataset):
-    """v1-vv2: Cb通道 → YOLO bbox 检测数据集 (单个数据源)。
+    """v1-vv2: 3 通道 BGR → YOLO bbox 检测数据集 (单个数据源)。
 
+    输入是完整 BGR 三通道 (channel 0 = B = 水印信号所在通道), **不要**抽 Cb。
     返回 (image_tensor, label_tensor) 其中 label_tensor 是 (N, 5):
         [class_id, cx, cy, w, h] 归一化坐标
     """
@@ -176,6 +198,9 @@ class LocatorDetectionDataset(Dataset):
         self.labels_dir = labels_dir
         self.image_size = image_size
         self.files = _list_images(images_dir)
+        if labels_dir is None and self.files:
+            logger.warning(f"  DetectionDataset: no labels dir for {images_dir} "
+                           f"-> all targets will be placeholders (pure negatives)")
         logger.info(f"  DetectionDataset: {len(self.files)} images from {images_dir}")
 
     def __len__(self):
@@ -194,15 +219,16 @@ class LocatorDetectionDataset(Dataset):
         if img.shape[:2] != (h, w):
             img = cv2.resize(img, (w, h))
 
-        ycrcb = cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb)
-        cb = ycrcb[:, :, 2]
-        cb_3ch = cv2.merge([cb, cb, cb])  # YOLO 需要 3 通道
-
-        image_t = torch.from_numpy(cb_3ch.transpose(2, 0, 1)).float() / 255.0  # (3, H, W)
+        # 3 通道 BGR (channel 0 = B = 水印信号所在通道); 不要抽 Cb
+        if img.ndim == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        image_t = torch.from_numpy(img.transpose(2, 0, 1)).float() / 255.0  # (3, H, W) BGR
         label_t = torch.tensor(labels, dtype=torch.float32)  # (N, 5)
         return image_t, label_t
 
     def _load_labels(self, image_name):
+        if self.labels_dir is None:
+            return [[0, 0.5, 0.5, 0.0, 0.0]]  # placeholder (无标注)
         stem = os.path.splitext(image_name)[0]
         path = os.path.join(self.labels_dir, stem + '.txt')
         labels = []
@@ -238,14 +264,17 @@ def build_multi_dataset(root_dir, split='train', task='segmentation',
     sub_datasets = []
     for info in datasets_info:
         images_dir = info.get(f'{split}_images')
-        labels_dir = info.get(f'{split}_labels')
         if images_dir is None:
             continue
 
         if task == 'segmentation':
-            ds = LocatorSegmentationDataset(images_dir, labels_dir, image_size)
+            # vv1: masks/ (灰度 PNG) 优先; 兼容旧字段 labels/ 指向 mask 的情况
+            ann_dir = info.get(f'{split}_masks') or info.get(f'{split}_labels')
+            ds = LocatorSegmentationDataset(images_dir, ann_dir, image_size)
         elif task == 'detection':
-            ds = LocatorDetectionDataset(images_dir, labels_dir, image_size)
+            # vv2: labels/ (YOLO txt) 优先
+            ann_dir = info.get(f'{split}_labels')
+            ds = LocatorDetectionDataset(images_dir, ann_dir, image_size)
         else:
             raise ValueError(f"Unknown task: {task}")
 

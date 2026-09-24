@@ -1,0 +1,26 @@
+# 冒烟: 两阶段各 1 epoch, 小样本, 验证 clean→noisy 数据能接到训练脚本上
+stages:
+  - name: clean_pretrain
+    data_root: /data1/lpl/datasets_labeled/clean
+    epochs: 1
+    lr: 0.001
+  - name: noisy_finetune
+    data_root: /data1/lpl/datasets_labeled/noisy
+    epochs: 1
+    lr: 0.0005
+
+data_root: /data1/lpl/datasets_labeled/noisy
+image_height: 540
+image_width: 960
+output_dir: output/smoke_vv1
+finetune:
+  weight_path: null
+batch_size: 2
+num_workers: 2
+lr: 0.001
+weight_decay: 0.0001
+epochs: 1
+save_every: 1
+seed: 42
+train_length: 24
+val_length: 8

@@ -215,8 +215,10 @@ class EfficientScreenMoireNoise(nn.Module):
     AMBIENT_GLARE_FLOOR_RANGE = (0.10, 0.30)
     NORMAL_TONE_GAMMA_RANGE = (0.96, 1.04)
     EXTREME_TONE_GAMMA_RANGE = (0.90, 1.10)
-    NORMAL_CONTENT_WARP_PIXELS_RANGE = (0.5, 2.0)
-    EXTREME_CONTENT_WARP_PIXELS_RANGE = (1.5, 5.0)
+    # Peak geometric displacement in pixels (normalised so residual peak == target).
+    # 0%-5% of short edge 1080 => 0-54 px (user spec 2026-09-24).
+    NORMAL_CONTENT_WARP_PIXELS_RANGE = (0.0, 18.0)
+    EXTREME_CONTENT_WARP_PIXELS_RANGE = (0.0, 54.0)
     LATTICE_SIGMA_TO_IMAGE_PSF = 4.0
     NORMAL_FULL_SIGNAL_CFA_MIX_RANGE = (0.08, 0.18)
     EXTREME_FULL_SIGNAL_CFA_MIX_RANGE = (0.14, 0.28)
@@ -380,8 +382,11 @@ class EfficientScreenMoireNoise(nn.Module):
     EXTREME_BEND_PIXELS_RANGE = (1.0, 5.0)
     NORMAL_RIPPLE_PIXELS_RANGE = (0.2, 1.4)
     EXTREME_RIPPLE_PIXELS_RANGE = (0.8, 3.0)
-    NORMAL_PERSPECTIVE_RANGE = (-0.018, 0.018)
-    EXTREME_PERSPECTIVE_RANGE = (-0.035, 0.035)
+    # Perspective (projective) content distortion, expressed as a **magnitude**
+    # fraction of the normalised coordinate (i.e. 0.03 = 3%).
+    # Sampled with _signed_uniform -> sign is random, |value| in [3%, 7%].
+    NORMAL_PERSPECTIVE_RANGE = (0.03, 0.07)
+    EXTREME_PERSPECTIVE_RANGE = (0.03, 0.07)
 
     # Both nearly orthogonal wave families must remain visible over the whole
     # screen; a very weak secondary family looks like a single straight grid.
@@ -3279,13 +3284,13 @@ class EfficientScreenMoireNoise(nn.Module):
             generator,
         )
         radial_scale = radial_pixels / half_short_edge
-        perspective_x = self._uniform(
+        perspective_x = self._signed_uniform(
             reference,
             *profile["perspective"],
             parameter_shape,
             generator,
         )
-        perspective_y = self._uniform(
+        perspective_y = self._signed_uniform(
             reference,
             *profile["perspective"],
             parameter_shape,

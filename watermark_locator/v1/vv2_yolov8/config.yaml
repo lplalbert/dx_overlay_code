@@ -1,26 +1,47 @@
 # v1-vv2: 独立识别 + YOLOv8 检测
 # 多数据集训练配置
 
-# 数据集根目录 (下所有子目录的 train/val 会被自动发现)
-data_root: /data1/lpl/datasets
+# ── 两阶段训练 (推荐): clean 预训练 → noisy 微调 ──
+# 后一阶段自动加载前一阶段的 best.pt。
+# 不写 stages 则退回单阶段 (用下面的 data_root / epochs / lr)。
+stages:
+  - name: clean_pretrain
+    data_root: /data1/lpl/datasets_labeled/clean
+    epochs: 10
+    lr: 0.01
+    patience: 0        # 短阶段关掉早停
+  - name: noisy_finetune
+    data_root: /data1/lpl/datasets_labeled/noisy
+    epochs: 50
+    lr: 0.005
+    patience: 30
 
-# 图像尺寸
+# 单阶段回退用的数据根目录 (下所有子目录的 train/val 会被自动发现)
+# noisy=pair 噪声版 (训练定位器用这个); clean=纯净水印版在 .../clean
+data_root: /data1/lpl/datasets_labeled/noisy
+
+# 落盘尺寸 (标签坐标系 = 1920x1080 水印画布)
 image_height: 1080
 image_width: 1920
 
 # 输出目录
 output_dir: output/v1_vv2_yolo
 
-# YOLO 模型
+# YOLO 模型 (imgsz 必须是 32 的倍数 — 原 1080 不是, 1080/32=33.75)
 model: yolov8n.pt
-imgsz: 1080
+imgsz: 640
 
-# 训练参数
-batch_size: 8
+device: "2"
+
+# 训练参数 (imgsz=640 实测 bs=32 仅 6.5GB; stages 里给了 lr/epochs 就以 stages 为准)
+batch_size: 16
 lr: 0.01
-epochs: 100
+epochs: 50
+patience: 30
+save_every: 10
+seed: 42
 
-# 噪声配置 (记录用, 实际噪声在数据集生成时应用)
+# 噪声配置 (记录用, 实际噪声在数据集生成时已应用到 noisy 树)
 noise_config:
   train_noise:
     - type: "pair"

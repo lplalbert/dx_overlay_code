@@ -4,17 +4,18 @@
 - 斜条纹模板: 45°方向, 周期4, 宽度2
 - 载体图像: 纯白图（后续可指定真实载体）
 - Pair噪声: 从[identity, wechat, tile_crop, pimog]随机选2种组合
+  - wechat = wechat_worst_case_compressor.py (真 JPEG q60 4:2:0)
+  - pimog  = physical_moire.py (屏-摄摩尔纹/曝光/PSF/CFA/ISP)
 - 输出: vv1 (U-Net分割mask) + vv2 (YOLO bbox)
 
 用法:
-    python generate_dataset.py --num_samples 100 --output_dir ./data --alpha 0.016
+    python generate_dataset.py --num_samples 100 --output_dir ./data --alpha 0.032
 """
 
 import argparse
 import json
 import math
 import os
-import random
 import sys
 
 import cv2
@@ -23,7 +24,7 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from utils import rs_encode, checkerboard_locator_positions, LOCATOR_CODEWORD_INDEX
+from utils import LOCATOR_CODEWORD_INDEX
 
 # ───────────────────── 常量 ─────────────────────
 
@@ -96,54 +97,38 @@ def gen_rect_tp(blockRow):
 
 
 def gen_block_single_uv(k=1, kv=1, blockRow=32, ratio_u=10, ratio_v=8,
-                        u_tp_fn=gen_rect_tp, v_tp_fn=None, channel_mode='cb'):
+                        u_tp_fn=gen_rect_tp, v_tp_fn=None, channel_mode='b'):
     """
     生成单个码字块的BGRA纹理。
 
     channel_mode:
-      'cb' — YCbCr域嵌入 (Cb/Cr 色度偏移), 对应 HLSL shader 的 Cb 通道
-      'b'  — RGB域嵌入 (B通道), 对应 generate_yellow_white_template.py 的黄/白编码
+      'b' / 'yw' — 黄/白 RGB 编码 (对应 generate_yellow_white_template.py
+                   的 TemplateColorMode::YellowWhiteRgb): 模板**只含 0 和 255**。
+                   黄色(信号) = (B,G,R) = (0,255,255); 白色(中性) = (255,255,255)
     """
     if v_tp_fn is None:
         v_tp_fn = lambda n: gen_diagonal_stripe_tp(n, period=4, width=2, angle_deg=45)
 
-    if channel_mode == 'b':
-        # B通道编码: 黄色(信号)=B:0, 白色(中性)=B:255, R=G=255
-        is_signal = (ratio_u != 0) or (ratio_v != 0)
-        b_val = 0 if is_signal else 255
-        b = np.full((blockRow, blockRow), b_val, dtype=np.uint8)
-        g = np.full((blockRow, blockRow), 255, dtype=np.uint8)
-        r = np.full((blockRow, blockRow), 255, dtype=np.uint8)
-        alpha = np.full((blockRow, blockRow), CHANNEL_ENCODING_ALPHA, dtype=np.uint8)
-        return cv2.merge((b, g, r, alpha))
-
-    # Cb通道编码: YCbCr域
-    y = np.full((blockRow, blockRow), 128, dtype=np.int16)
-    cr = np.full((blockRow, blockRow), 128, dtype=np.int16)
-    cb = np.full((blockRow, blockRow), 128, dtype=np.int16)
-
-    if ratio_u != 0:
-        cr_delta = u_tp_fn(blockRow).astype(np.int16) * ratio_u // 10
-        cr += cr_delta if k == 1 else -cr_delta
-
-    if ratio_v != 0:
-        cb_delta = v_tp_fn(blockRow).astype(np.int16) * ratio_v // 10
-        cb += cb_delta if kv == 1 else -cb_delta
-
-    y = np.clip(y, 0, 255).astype(np.uint8)
-    cr = np.clip(cr, 0, 255).astype(np.uint8)
-    cb = np.clip(cb, 0, 255).astype(np.uint8)
+    # 黄/白 RGB 编码: 模板只取 0 和 255 两个值
+    #   黄色(信号) = (B,G,R)=(0,255,255)  即 B=0
+    #   白色(中性) = (B,G,R)=(255,255,255) 即 B=255
+    is_signal = (ratio_u != 0) or (ratio_v != 0)
+    b_val = 0 if is_signal else 255
+    b = np.full((blockRow, blockRow), b_val, dtype=np.uint8)
+    g = np.full((blockRow, blockRow), 255, dtype=np.uint8)
+    r = np.full((blockRow, blockRow), 255, dtype=np.uint8)
     alpha = np.full((blockRow, blockRow), CHANNEL_ENCODING_ALPHA, dtype=np.uint8)
-    return cv2.merge((cb, cr, y, alpha))
+    return cv2.merge((b, g, r, alpha))
 
 
 def gen_wm_block(pattern_64, block_size=64, ratio_u=10, ratio_v=8,
-                 type_val=0, inverse=False, v_tp_fn=None, channel_mode='cb'):
+                 type_val=0, inverse=False, v_tp_fn=None, channel_mode='b'):
     """从64值pattern生成完整的8x8水印块。
 
     参考 generate_yellow_white_template.py 的黄色/白色编码:
-    - "黄色"单元格 (信号): 有 Cb/Cr 色度差, 条纹掩码调制其显隐
-    - "白色"单元格 (无信号): 色度恒为 128 (中性), 始终不变
+    - "黄色"单元格 (信号): B=0 (模板值 0), 条纹掩码调制其显隐
+    - "白色"单元格 (无信号): B=255 (模板值 255), 始终不变
+    模板只含 0 / 255 两个值。
     """
     seq = np.asarray(pattern_64).reshape(-1)
     assert seq.size == WATERMARK_GRID_CELLS
@@ -183,113 +168,66 @@ def gen_wm_block(pattern_64, block_size=64, ratio_u=10, ratio_v=8,
     return img
 
 
-# ───────────────────── 噪声模型 (参考fftmask/pair噪声) ─────────────────────
+# ───────────────────── 噪声模型 (pair噪声) ─────────────────────
+# 微信压缩  ← wechat_worst_case_compressor.py  (真实 JPEG 量化表, q60 4:2:0)
+# 拍照模拟  ← physical_moire.py                (屏-摄摩尔纹/曝光/PSF/CFA/ISP)
+# 几何噪声 (tile_crop) 自实现, 同步变换 mask/bboxes。
 
-# 预计算DCT矩阵
-_DCT_MAT = np.zeros((8, 8), dtype=np.float64)
-for u in range(8):
-    for x in range(8):
-        alpha_u = math.sqrt(1.0 / 8.0) if u == 0 else math.sqrt(2.0 / 8.0)
-        _DCT_MAT[u, x] = alpha_u * math.cos((2 * x + 1) * u * math.pi / 16.0)
-_DCT_MAT_T = _DCT_MAT.T.copy()
-
-_JPEG_ZIGZAG_IDX = [
-    (0,0),(0,1),(1,0),(2,0),(1,1),(0,2),(0,3),(1,2),
-    (2,1),(3,0),(4,0),(3,1),(2,2),(1,3),(0,4),(0,5),
-    (1,4),(2,3),(3,2),(4,1),(5,0),(6,0),(5,1),(4,2),
-    (3,3),(2,4),(1,5),(0,6),(0,7),(1,6),(2,5),(3,4),
-    (4,3),(5,2),(6,1),(7,0),(7,1),(6,2),(5,3),(4,4),
-    (3,5),(2,6),(1,7),(2,7),(3,6),(4,5),(5,4),(6,3),
-    (7,2),(7,3),(6,4),(5,5),(4,6),(3,7),(4,7),(5,6),
-    (6,5),(7,4),(7,5),(6,6),(5,7),(6,7),(7,6),(7,7),
-]
+_WECHAT_COMPRESSOR = None
+_WECHAT_PRESET = 'mainstream_worst'
+_MOIRE_SIM = None
 
 
-def _get_zigzag_mask(zigzag_keep):
-    mask = np.zeros((8, 8), dtype=np.float64)
-    for k in range(min(zigzag_keep, 64)):
-        r, c = _JPEG_ZIGZAG_IDX[k]
-        mask[r, c] = 1.0
-    return mask
+def _get_wechat_compressor(preset=None):
+    """懒加载 wechat_worst_case_compressor.WeChatWorstCaseCompressor。"""
+    global _WECHAT_COMPRESSOR, _WECHAT_PRESET
+    preset = preset or _WECHAT_PRESET
+    if _WECHAT_COMPRESSOR is None or _WECHAT_PRESET != preset:
+        from wechat_worst_case_compressor import WeChatWorstCaseCompressor
+        _WECHAT_COMPRESSOR = WeChatWorstCaseCompressor.from_preset(preset)
+        _WECHAT_PRESET = preset
+    return _WECHAT_COMPRESSOR
 
 
-def _whole_plane_dct_hf_zero(plane, keep_ratio):
-    h, w = plane.shape
-    ph = int(math.ceil(h / 8.0) * 8)
-    pw = int(math.ceil(w / 8.0) * 8)
-    padded = np.zeros((ph, pw), dtype=np.float64)
-    padded[:h, :w] = plane - 128.0
-    nbh, nbw = ph // 8, pw // 8
-    blocks = padded.reshape(nbh, 8, nbw, 8).transpose(0, 2, 1, 3).reshape(-1, 8, 8)
-    dct_coeff = np.einsum('ij,bjk,kl->bil', _DCT_MAT, blocks, _DCT_MAT_T)
-    keep = max(1, int(64 * keep_ratio))
-    mask = _get_zigzag_mask(keep)
-    dct_coeff *= mask
-    recon = np.einsum('ij,bjk,kl->bil', _DCT_MAT_T, dct_coeff, _DCT_MAT)
-    recon = recon.reshape(nbh, nbw, 8, 8).transpose(0, 2, 1, 3).reshape(ph, pw)
-    return np.clip(recon[:h, :w] + 128.0, 0.0, 255.0)
+def add_wechat_noise(image, preset=None):
+    """微信最坏情况压缩 — 复用 wechat_worst_case_compressor.py。
 
+    流程 (与参考实现一致):
+      1. 短边缩到 1280 (4:3 图缩到 1706x1279); 1920x1080 短边 1080 < 1280 → 不缩
+      2. GaussianBlur radius=0.6
+      3. 真 JPEG 编解码: IJG 标准亮度/色度量化表按 quality=60 缩放, 4:2:0 子采样
 
-def _chroma_420_downsample(plane):
-    h, w = plane.shape
-    h_even = h + (h % 2)
-    w_even = w + (w % 2)
-    padded = np.zeros((h_even, w_even), dtype=plane.dtype)
-    padded[:h, :w] = plane
-    ch, cw = h_even // 2, w_even // 2
-    return padded.reshape(ch, 2, cw, 2).mean(axis=(1, 3))
+    非几何 (输出画布与输入一致), mask/bbox 无需改动。
+    """
+    from PIL import Image
 
-
-def _chroma_420_upsample(plane2, h, w):
-    return np.repeat(np.repeat(plane2, 2, axis=0), 2, axis=1)[:h, :w]
-
-
-def add_wechat_noise(image, zigzag_keep=21):
-    """模拟微信JPEG压缩: 下采样→YCbCr→DCT高频清零→重建"""
     if len(image.shape) == 2:
         image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
     h, w = image.shape[:2]
 
-    # 下采样→上采样
-    small = cv2.resize(image, (w // 2, h // 2), interpolation=cv2.INTER_AREA)
-    image = cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+    compressor = _get_wechat_compressor(preset)
+    pil_in = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+    pil_out = compressor.compress_to_image(pil_in)
 
-    # YCbCr → DCT高频清零
-    keep_ratio = zigzag_keep / 64.0
-    img_f = image.astype(np.float64)
-    b, g, r = img_f[..., 0], img_f[..., 1], img_f[..., 2]
+    # 参考实现的缩放规则只对长边/短边超阈值的图生效; 万一触发了缩放,
+    # 恢复回原画布尺寸以保证标签坐标系不变 (训练分辨率 1920x1080 下不会触发)。
+    if pil_out.size != (w, h):
+        resample = getattr(Image, 'Resampling', Image).LANCZOS
+        pil_out = pil_out.resize((w, h), resample)
 
-    y = 0.299 * r + 0.587 * g + 0.114 * b
-    cb = -0.168736 * r - 0.331264 * g + 0.5 * b + 128.0
-    cr = 0.5 * r - 0.418688 * g - 0.081312 * b + 128.0
-
-    cb2 = _chroma_420_downsample(cb)
-    cr2 = _chroma_420_downsample(cr)
-
-    yq = _whole_plane_dct_hf_zero(y, keep_ratio)
-    cbq = _whole_plane_dct_hf_zero(cb2, keep_ratio)
-    crq = _whole_plane_dct_hf_zero(cr2, keep_ratio)
-
-    hh, ww = y.shape
-    cb_up = _chroma_420_upsample(cbq, hh, ww)
-    cr_up = _chroma_420_upsample(crq, hh, ww)
-
-    out_b = yq + 1.772 * (cb_up - 128.0)
-    out_g = yq - 0.344136 * (cb_up - 128.0) - 0.714136 * (cr_up - 128.0)
-    out_r = yq + 1.402 * (cr_up - 128.0)
-    out = np.stack([out_b, out_g, out_r], axis=-1)
-    return np.clip(np.round(out), 0, 255).astype(np.uint8)
+    return cv2.cvtColor(np.array(pil_out.convert('RGB')), cv2.COLOR_RGB2BGR)
 
 
 def add_tile_rotate_crop_noise(image, mask=None, bboxes=None,
-                               angle_range=(-5, 5), max_shift=0.5):
+                               angle_range=(-5, 5), max_shift=0.5, rng=None):
     """循环平移+旋转: 3x3拼接→旋转→中心裁剪。同步变换mask和bboxes。"""
+    r = np.random if rng is None else rng
     h, w = image.shape[:2]
     is_gray = len(image.shape) == 2
 
     tiled = np.tile(image, (3, 3)) if is_gray else np.tile(image, (3, 3, 1))
 
-    angle = np.random.uniform(angle_range[0], angle_range[1])
+    angle = r.uniform(angle_range[0], angle_range[1])
     center = (tiled.shape[1] / 2, tiled.shape[0] / 2)
     M = cv2.getRotationMatrix2D(center, angle, 1.0)
     rotated = cv2.warpAffine(tiled, M, (tiled.shape[1], tiled.shape[0]),
@@ -298,8 +236,8 @@ def add_tile_rotate_crop_noise(image, mask=None, bboxes=None,
     crop_h, crop_w = h, w
     max_offset_x = min(int(w * max_shift), (3 * w - crop_w) // 2 - 1)
     max_offset_y = min(int(h * max_shift), (3 * h - crop_h) // 2 - 1)
-    crop_cx = w + np.random.randint(-max_offset_x, max_offset_x + 1)
-    crop_cy = h + np.random.randint(-max_offset_y, max_offset_y + 1)
+    crop_cx = w + int(r.randint(-max_offset_x, max_offset_x + 1))
+    crop_cy = h + int(r.randint(-max_offset_y, max_offset_y + 1))
     x0 = crop_cx - crop_w // 2
     y0 = crop_cy - crop_h // 2
     cropped = rotated[y0:y0 + crop_h, x0:x0 + crop_w]
@@ -354,82 +292,221 @@ def add_tile_rotate_crop_noise(image, mask=None, bboxes=None,
     return cropped, mask, bboxes
 
 
-def add_pimog_noise(image, mask=None, bboxes=None):
-    """PIMOG噪声: 透视+光照扭曲+摩尔纹+高斯噪声。同步变换mask和bboxes。"""
-    h, w = image.shape[:2]
-    img_f = image.astype(np.float64) / 255.0
+class _WarpCapturingMoire:
+    """EfficientScreenMoireNoise 的薄封装: 额外记录 content-warp 采样网格。
 
-    # 轻微透视 (随机四角偏移, ±30px ≈ 1.5% 宽度)
-    src_pts = np.float32([[0, 0], [w-1, 0], [w-1, h-1], [0, h-1]])
-    dst_pts = src_pts + np.random.uniform(-30, 30, src_pts.shape).astype(np.float32)
-    M = cv2.getPerspectiveTransform(src_pts, dst_pts)
-    img_f = cv2.warpPerspective(img_f, M, (w, h), borderMode=cv2.BORDER_REFLECT_101)
+    参考实现的 forward() 只返回图像; 训练需要 mask/bbox 与图像同步,
+    因此这里复刻 _warp_content_with_projected_residual 并保存 grid
+    (output[i,j] 从 input 的 grid[i,j] 处采样), 供标签反变换使用。
+    其余摩尔纹/曝光/PSF/CFA/ISP 全部走原实现, 不做任何改动。
+    """
 
-    # ── 同步变换 mask ──
+    def __init__(self, device='cpu', **overrides):
+        import torch
+        import torch.nn.functional as F
+        from physical_moire import EfficientScreenMoireNoise
+
+        outer = self
+
+        class _Capturing(EfficientScreenMoireNoise):
+            def _warp_content_with_projected_residual(
+                    self, image, projected_coordinates, is_extreme, generator):
+                # 与 physical_moire.EfficientScreenMoireNoise 同实现, 仅多存 grid
+                if self.content_warp_scale == 0.0:
+                    outer.last_grid = None
+                    return image
+                screen_x, screen_y = projected_coordinates
+                batch, _, height, width = image.shape
+                centre_y = height // 2
+                centre_x = width // 2
+                horizontal_x, vertical_x = self._local_spatial_gradients(screen_x)
+                horizontal_y, vertical_y = self._local_spatial_gradients(screen_y)
+                pixel_x = torch.arange(
+                    width, device=image.device, dtype=image.dtype
+                ).view(1, 1, 1, width)
+                pixel_y = torch.arange(
+                    height, device=image.device, dtype=image.dtype
+                ).view(1, 1, height, 1)
+                relative_x = pixel_x - float(centre_x)
+                relative_y = pixel_y - float(centre_y)
+
+                def projective_residual(coordinate, horizontal, vertical):
+                    centre = coordinate[:, :, centre_y, centre_x].view(batch, 1, 1, 1)
+                    slope_x = horizontal[:, :, centre_y, centre_x].view(batch, 1, 1, 1)
+                    slope_y = vertical[:, :, centre_y, centre_x].view(batch, 1, 1, 1)
+                    affine = centre + slope_x * relative_x + slope_y * relative_y
+                    return coordinate - affine
+
+                residual_x = projective_residual(screen_x, horizontal_x, vertical_x)
+                residual_y = projective_residual(screen_y, horizontal_y, vertical_y)
+                residual_peak = (
+                    residual_x.square() + residual_y.square()
+                ).sqrt().amax(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+                profile = self._profile_ranges(is_extreme)
+                target_pixels = self._uniform(
+                    image, *profile["content_warp_pixels"], (batch, 1, 1, 1), generator
+                ) * self.content_warp_scale
+                displacement_x = residual_x * (target_pixels / residual_peak)
+                displacement_y = residual_y * (target_pixels / residual_peak)
+
+                identity_x = torch.linspace(
+                    -1.0, 1.0, width, device=image.device, dtype=image.dtype
+                ).view(1, 1, width).expand(batch, height, width)
+                identity_y = torch.linspace(
+                    -1.0, 1.0, height, device=image.device, dtype=image.dtype
+                ).view(1, height, 1).expand(batch, height, width)
+                grid_x = identity_x + (
+                    2.0 * displacement_x[:, 0] / float(max(width - 1, 1))
+                )
+                grid_y = identity_y + (
+                    2.0 * displacement_y[:, 0] / float(max(height - 1, 1))
+                )
+                grid = torch.stack((grid_x, grid_y), dim=-1)
+                outer.last_grid = grid.detach()
+                return F.grid_sample(
+                    image, grid, mode="bilinear", padding_mode="border",
+                    align_corners=True,
+                )
+
+        self.core = _Capturing(device=device, **overrides).eval()
+        self.last_grid = None
+        self.device = device
+
+    def __call__(self, img, generator=None):
+        self.last_grid = None
+        return self.core(img, generator=generator)
+
+
+def _get_moire_sim():
+    """懒加载屏-摄模拟器 (screen_capture 全链路: 摩尔纹+曝光+PSF+CFA+ISP)。"""
+    global _MOIRE_SIM
+    if _MOIRE_SIM is None:
+        import torch
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        _MOIRE_SIM = _WarpCapturingMoire(device=device)
+    return _MOIRE_SIM
+
+
+def _bilinear_sample(plane, xs, ys):
+    """在 2D 图上按浮点像素坐标采样 (越界用最近值填充)。"""
+    h, w = plane.shape
+    xs = np.clip(xs, 0.0, w - 1.0)
+    ys = np.clip(ys, 0.0, h - 1.0)
+    x0 = np.floor(xs).astype(np.int32)
+    y0 = np.floor(ys).astype(np.int32)
+    x1 = np.minimum(x0 + 1, w - 1)
+    y1 = np.minimum(y0 + 1, h - 1)
+    fx = xs - x0
+    fy = ys - y0
+    return (plane[y0, x0] * (1 - fx) * (1 - fy) + plane[y0, x1] * fx * (1 - fy) +
+            plane[y1, x0] * (1 - fx) * fy + plane[y1, x1] * fx * fy)
+
+
+def _sync_labels_to_warp(mask, bboxes, grid, h, w):
+    """用 content-warp 采样网格同步 mask/bboxes。
+
+    grid 为 output→input 采样映射, 故图像与 mask 用同一 grid 拉样即可对齐;
+    bbox 的 input 角点 p 对应 output 角点 q ≈ p − disp(p) (形变仅 0.5~5px)。
+    """
+    import torch
+    import torch.nn.functional as F
+
+    if grid is None:
+        return mask, bboxes
+
     if mask is not None:
-        mask = cv2.warpPerspective(mask, M, (w, h), borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        m = torch.from_numpy(mask.astype(np.float32)).view(1, 1, h, w).to(grid.device)
+        m_w = F.grid_sample(m, grid, mode='bilinear', padding_mode='zeros',
+                            align_corners=True)
+        mask = (m_w[0, 0].cpu().numpy() > 127).astype(np.uint8) * 255
 
-    # ── 同步变换 bboxes ──
     if bboxes is not None and len(bboxes) > 0:
+        # grid 归一化坐标 → 像素位移场
+        identity_x = np.linspace(-1.0, 1.0, w, dtype=np.float32)[None, :]
+        identity_y = np.linspace(-1.0, 1.0, h, dtype=np.float32)[:, None]
+        g = grid[0].cpu().numpy()
+        disp_x = (g[..., 0] - identity_x) * (w - 1) / 2.0
+        disp_y = (g[..., 1] - identity_y) * (h - 1) / 2.0
+
         new_bboxes = []
         for bbox in bboxes:
             cls, cx_n, cy_n, bw_n, bh_n = bbox
             cx_px, cy_px = cx_n * w, cy_n * h
             bw_px, bh_px = bw_n * w, bh_n * h
             corners = np.array([
-                [cx_px - bw_px/2, cy_px - bh_px/2],
-                [cx_px + bw_px/2, cy_px - bh_px/2],
-                [cx_px + bw_px/2, cy_px + bh_px/2],
-                [cx_px - bw_px/2, cy_px + bh_px/2],
+                [cx_px - bw_px / 2, cy_px - bh_px / 2],
+                [cx_px + bw_px / 2, cy_px - bh_px / 2],
+                [cx_px + bw_px / 2, cy_px + bh_px / 2],
+                [cx_px - bw_px / 2, cy_px + bh_px / 2],
             ], dtype=np.float32)
-            ones = np.ones((4, 1), dtype=np.float32)
-            corners_h = np.hstack([corners, ones])
-            warped = (M @ corners_h.T).T
-            warped = warped[:, :2] / warped[:, 2:3]  # 透视除法
+            sx = _bilinear_sample(disp_x, corners[:, 0], corners[:, 1])
+            sy = _bilinear_sample(disp_y, corners[:, 0], corners[:, 1])
+            warped = corners.copy()
+            warped[:, 0] -= sx
+            warped[:, 1] -= sy
             x_min = np.clip(warped[:, 0].min(), 0, w)
             y_min = np.clip(warped[:, 1].min(), 0, h)
             x_max = np.clip(warped[:, 0].max(), 0, w)
             y_max = np.clip(warped[:, 1].max(), 0, h)
             if x_max - x_min > 2 and y_max - y_min > 2:
-                new_cx = (x_min + x_max) / 2 / w
-                new_cy = (y_min + y_max) / 2 / h
-                new_bw = (x_max - x_min) / w
-                new_bh = (y_max - y_min) / h
-                new_bboxes.append([cls, new_cx, new_cy, new_bw, new_bh])
+                new_bboxes.append([
+                    int(cls),
+                    float((x_min + x_max) / 2 / w),
+                    float((y_min + y_max) / 2 / h),
+                    float((x_max - x_min) / w),
+                    float((y_max - y_min) / h),
+                ])
         bboxes = new_bboxes
 
-    # 光照扭曲
-    a = 0.7 + random.random() * 0.2
-    b = 1.1 + random.random() * 0.2
-    direction = random.randint(1, 4)
-    Y, X = np.mgrid[0:h, 0:w].astype(np.float64)
-    if direction in (1, 3):
-        t = Y / max(h - 1, 1)
-    else:
-        t = X / max(w - 1, 1)
-    if direction in (3, 4):
-        t = 1.0 - t
-    val = a + (b - a) * t
-    img_f *= val[..., np.newaxis] * 0.85
+    return mask, bboxes
 
-    # 摩尔纹
-    theta = np.random.uniform(0, np.pi)
-    cx, cy = np.random.uniform(0, w), np.random.uniform(0, h)
-    dist = np.sqrt((Y - cy)**2 + (X - cx)**2)
-    z1 = 0.5 + 0.5 * np.cos(2 * np.pi * dist)
-    phase = np.cos(theta) * X + np.sin(theta) * Y
-    z2 = 0.5 + 0.5 * np.cos(phase)
-    moire = (np.minimum(z1, z2)) * 2 - 1
-    img_f += moire[..., np.newaxis] * 0.15
 
-    # 高斯噪声
-    img_f += np.random.normal(0, 0.03, img_f.shape)
+def add_pimog_noise(image, mask=None, bboxes=None, rng=None):
+    """拍照模拟 — 复用 physical_moire.py 的屏-摄物理模拟 (screen_capture 全链路)。
 
-    return np.clip(np.round(img_f * 255), 0, 255).astype(np.uint8), mask, bboxes
+    覆盖: 标定屏幕/相机单应投影、倒格子摩尔纹(主阶+弱次阶)、光学 PSF、
+    Bayer/CFA 重建、传感器噪声、环境光照/白平衡/色调、残差投影形变。
+    形变只有 0.5~5px, 经 content-warp 网格同步到 mask/bboxes。
+    """
+    import torch
+
+    if len(image.shape) == 2:
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    h, w = image.shape[:2]
+
+    sim = _get_moire_sim()
+    device = sim.core._device_anchor.device
+
+    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    tensor = (torch.from_numpy(rgb)
+              .permute(2, 0, 1).unsqueeze(0)
+              .to(device=device, dtype=torch.float32)
+              .div_(255.0))
+
+    generator = None
+    if rng is not None:
+        generator = torch.Generator(device=device)
+        generator.manual_seed(int(rng.randint(0, 2 ** 31 - 1)))
+
+    with torch.inference_mode():
+        out = sim(tensor, generator=generator)
+        grid = sim.last_grid
+
+    out_bgr = (out[0].permute(1, 2, 0).clamp(0, 1)
+               .mul(255).round().to(torch.uint8).cpu().numpy())
+    out_bgr = cv2.cvtColor(out_bgr, cv2.COLOR_RGB2BGR)
+
+    mask, bboxes = _sync_labels_to_warp(mask, bboxes, grid, h, w)
+    return out_bgr, mask, bboxes
 
 
 def apply_pair_noise(image, mask=None, bboxes=None, rng=None):
-    """Pair噪声: 从[identity, wechat, tile_crop, pimog]随机选2种组合。几何噪声同步变换mask和bboxes。"""
+    """Pair噪声: 从[identity, wechat, tile_crop, pimog]随机选2种组合。
+
+    - wechat : wechat_worst_case_compressor.py 真 JPEG 压缩, 非几何
+    - pimog  : physical_moire.py 屏-摄拍照模拟, 残差形变同步 mask/bbox
+    - tile_crop: 3x3 平铺+旋转+裁剪, 同步 mask/bbox (并复制 9 份 bbox)
+    """
     noise_pool = ['identity', 'wechat', 'tile_crop', 'pimog']
     first = rng.choice(noise_pool) if rng else np.random.choice(noise_pool)
     second_pool = [n for n in noise_pool if n != first]
@@ -441,41 +518,45 @@ def apply_pair_noise(image, mask=None, bboxes=None, rng=None):
         elif noise_type == 'wechat':
             image = add_wechat_noise(image)  # 非几何，标签不变
         elif noise_type == 'tile_crop':
-            image, mask, bboxes = add_tile_rotate_crop_noise(image, mask, bboxes)
+            image, mask, bboxes = add_tile_rotate_crop_noise(image, mask, bboxes, rng=rng)
         elif noise_type == 'pimog':
-            image, mask, bboxes = add_pimog_noise(image, mask, bboxes)
+            image, mask, bboxes = add_pimog_noise(image, mask, bboxes, rng=rng)
 
-    return image, mask, bboxes, [first, second]
+    return image, mask, bboxes, [str(first), str(second)]
 
 
 # ───────────────────── alpha融合 ─────────────────────
 
-def alpha_blend_watermark(carrier_bgr, watermark_bgra, alpha, channel_mode='cb'):
-    """模拟HLSL shader的alpha融合。
+def alpha_blend_watermark(carrier_bgr, watermark_bgra, alpha, channel_mode='b'):
+    """模拟 HLSL shader 的 alpha 融合。
 
-    channel_mode='cb': YCbCr域嵌入, YCbCr→RGB 后混合
-    channel_mode='b':  B通道嵌入, 直接 RGB 混合 (黄/白)
+    契约 (对应 overlay.cpp 旧 RGB(A) 路径 + overlay_texture.cpp 的
+    SrcBlend=ONE / DestBlend=INV_SRC_ALPHA):
+
+        out = α_eff * template + (1 - α_eff) * carrier
+        α_eff = α * dynamicMask
+        dynamicMask = saturate( max_c |template_c/255 - 1| * 2 )
+
+    模板只含 0 / 255:
+      - 白色(中性)像素 (255,255,255) → dynamicMask = 0 → **完全不改**
+      - 黄色(信号)像素 (0,255,255)   → dynamicMask = 1 → α_eff = α
+        max|out - carrier| = α × 255 = 0.032 × 255 = 8.16
+
+    channel_mode='b' / 'yw': 黄/白 RGB 编入 (模板 0/255)
     """
-    if channel_mode == 'b':
-        wm_bgr = watermark_bgra[:, :, :3].astype(np.float32)
-    else:
-        cb = watermark_bgra[:, :, 0].astype(np.float32)
-        cr = watermark_bgra[:, :, 1].astype(np.float32)
-        y  = watermark_bgra[:, :, 2].astype(np.float32)
+    wm_bgr = watermark_bgra[:, :, :3].astype(np.float32)
 
-        cr_dev = cr - 128.0
-        cb_dev = cb - 128.0
-
-        r = y + 1.402 * cr_dev
-        g = y - 0.714136 * cr_dev - 0.344136 * cb_dev
-        b = y + 1.772 * cb_dev
-
-        wm_rgb = np.clip(np.stack([r, g, b], axis=-1), 0, 255).astype(np.float32)
-        wm_bgr = wm_rgb[:, :, ::-1]
+    # 旧 RGB(A) 路径的 dynamicMask: 偏离白色的幅度, saturate(dev*2)
+    # 0/255 模板下 dev ∈ {0, 1} → mask ∈ {0, 1}
+    dev = np.max(np.abs(wm_bgr - 255.0), axis=2) / 255.0
+    dynamic_mask = np.minimum(1.0, dev * 2.0).astype(np.float32)
+    a_eff = (alpha * dynamic_mask)[:, :, None]
 
     carrier = carrier_bgr.astype(np.float32)
-    result = carrier * (1.0 - alpha) + wm_bgr * alpha
-    return np.clip(result, 0, 255).astype(np.uint8)
+    result = carrier * (1.0 - a_eff) + wm_bgr * a_eff
+    # 必须四舍五入再落盘: astype(uint8) 是截断, 会把 246.84 收成 246,
+    # 让 |Δ| 从 8 变成 9, 突破 0.032×255=8.16 的上界。
+    return np.clip(np.round(result), 0, 255).astype(np.uint8)
 
 
 # ───────────────────── 定位块位置 ─────────────────────
@@ -497,10 +578,93 @@ def get_locator_abs_rect(i, j):
     return (x, y, MSG_W, MSG_H)
 
 
+# ───────────────────── 画布拼装 (无缩放) ─────────────────────
+
+# 候选网格 (cols, rows), cell = (1920//cols, 1080//rows), 需整除
+_CANVAS_GRIDS = (
+    (1, 1), (2, 1), (2, 2), (3, 2), (3, 3),
+    (4, 2), (4, 3), (4, 4), (6, 3), (6, 4), (8, 4),
+)
+
+
+def _fits(shape_hw, cell_h, cell_w):
+    h, w = shape_hw[:2]
+    return w >= cell_w and h >= cell_h
+
+
+def pick_canvas_grid(src_shapes, target_w=1920, target_h=1080, min_coverage=0.85):
+    """按源图尺寸选网格: 取**格子最大**(缝最少)且 ≥min_coverage 源图能 1:1 裁出的。"""
+    shapes = list(src_shapes)
+    for cols, rows in _CANVAS_GRIDS:
+        if target_w % cols or target_h % rows:
+            continue
+        cell_w, cell_h = target_w // cols, target_h // rows
+        cov = np.mean([_fits(s, cell_h, cell_w) for s in shapes]) if shapes else 0.0
+        if cov >= min_coverage:
+            return cols, rows
+    cols, rows = _CANVAS_GRIDS[-1]
+    return cols, rows
+
+
+def crop_tile_1x1(img, cell_h, cell_w, rng):
+    """1:1 裁出 cell_h x cell_w — **绝不缩放**。
+
+    源图不够大时裁到能给的最大区域, 缺边用边缘复制补齐
+    (复制不插值, 不会把纹理低通成糊的)。
+    """
+    h, w = img.shape[:2]
+    if h >= cell_h and w >= cell_w:
+        y0 = int(rng.randint(0, h - cell_h + 1))
+        x0 = int(rng.randint(0, w - cell_w + 1))
+        return img[y0:y0 + cell_h, x0:x0 + cell_w].copy()
+    ch, cw = min(h, cell_h), min(w, cell_w)
+    y0 = int(rng.randint(0, h - ch + 1)) if h > ch else 0
+    x0 = int(rng.randint(0, w - cw + 1)) if w > cw else 0
+    patch = img[y0:y0 + ch, x0:x0 + cw]
+    if ch < cell_h or cw < cell_w:
+        patch = cv2.copyMakeBorder(patch, 0, cell_h - ch, 0, cell_w - cw,
+                                   borderType=cv2.BORDER_REPLICATE)
+    return patch.copy()
+
+
+def build_canvas(src_imgs, rng, target_w=1920, target_h=1080, grid=None):
+    """无缩放把源图拼成 target_w x target_h 画布。
+
+    resize 会把 640x480 放大 3 倍, 纹理被低通成糊的, 和真实截屏不符;
+    这里一律保持原生像素密度, 每格一张源图的 1:1 裁剪:
+
+      * grid=(1, 1) 且源图够大 (bcgd):
+            单幅 1:1 随机裁剪 — 连贯场景, 无重采样, 最贴近真实截屏
+      * 其它 (coco / document):
+            原生分辨率网格平铺, 每格独立 1:1 裁剪
+
+    每个数据集各自拼自己的画布, 不跨集混拼。
+    """
+    if grid is None:
+        shapes = [im.shape for im in src_imgs]
+        grid = pick_canvas_grid(shapes, target_w, target_h)
+    cols, rows = grid
+    cell_w = target_w // cols
+    cell_h = target_h // rows
+
+    canvas = np.zeros((rows * cell_h, cols * cell_w, 3), dtype=np.uint8)
+    k = 0
+    for r in range(rows):
+        for c in range(cols):
+            src = src_imgs[k % len(src_imgs)]
+            canvas[r * cell_h:(r + 1) * cell_h, c * cell_w:(c + 1) * cell_w] = \
+                crop_tile_1x1(src, cell_h, cell_w, rng)
+            k += 1
+
+    if canvas.shape[0] == target_h and canvas.shape[1] == target_w:
+        return canvas
+    return crop_tile_1x1(canvas, target_h, target_w, rng)
+
+
 # ───────────────────── 数据集生成 ─────────────────────
 
 def generate_one_sample(wm_id, fix_fg_matrix, locator_pattern, alpha, rng,
-                        carrier_img=None, apply_noise=True, channel_mode='cb'):
+                        carrier_img=None, apply_noise=True, channel_mode='b'):
     """生成一个训练样本。"""
     from rs_gen_Syn_template_nums_dual import get_wm_seq
     wm_seq = list(get_wm_seq(wm_id))
@@ -518,7 +682,11 @@ def generate_one_sample(wm_id, fix_fg_matrix, locator_pattern, alpha, rng,
     all_messages = [wm_seq[i*4:(i+1)*4] for i in range(4)]
 
     def resize_tmpl(img, w, h):
-        return cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
+        # 黄/白模式必须保持模板二值 0/255 — INTER_AREA 会在格子边界产生
+        # 中间值, 让 max|Δ| 偏离 0.032×255; 用 NEAREST + 阈值锁死二值。
+        out = cv2.resize(img, (w, h), interpolation=cv2.INTER_NEAREST)
+        out[:, :, :3] = np.where(out[:, :, :3] >= 128, 255, 0).astype(np.uint8)
+        return out
 
     wm_blocks = []
     for msgs in all_messages:
@@ -556,19 +724,15 @@ def generate_one_sample(wm_id, fix_fg_matrix, locator_pattern, alpha, rng,
     # ── 全局斜条纹调制 (学习自 generate_yellow_white_template.py) ──
     # 条纹 keep 掩码只作用于"黄色"(信号)单元格; "白色"(中性)单元格始终不变
     keep = stripe_mask(SCREEN_W, SCREEN_H, angle=45.0, period=4, stripe_width=2)
-    if channel_mode == 'b':
-        # B通道: 黄色单元格 B=0, 条纹外恢复 B=255 (白色不受影响)
-        wm_full[:, :, 0][~keep] = 255
-    else:
-        # Cb/Cr通道: 非条纹区域的色度偏移清零 (白色=128不受影响)
-        for ch in range(2):
-            delta = wm_full[:, :, ch].astype(np.float32) - 128.0
-            delta[~keep] = 0.0
-            wm_full[:, :, ch] = np.clip(delta + 128.0, 0, 255).astype(np.uint8)
+    # B通道: 黄色单元格 B=0, 条纹外恢复 B=255 (白色不受影响)
+    wm_full[:, :, 0][~keep] = 255
 
-    # alpha融合
+    # alpha融合 — 载体已是画布尺寸时禁止 resize (会抹掉高频纹理)
     if carrier_img is not None:
-        carrier = cv2.resize(carrier_img, (SCREEN_W, SCREEN_H))
+        if carrier_img.shape[:2] == (SCREEN_H, SCREEN_W):
+            carrier = carrier_img
+        else:
+            carrier = cv2.resize(carrier_img, (SCREEN_W, SCREEN_H))
     else:
         carrier = np.full((SCREEN_H, SCREEN_W, 3), 255, dtype=np.uint8)
 
@@ -587,15 +751,16 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--num_samples", type=int, default=100)
     parser.add_argument("--output_dir", type=str, default="./data")
-    parser.add_argument("--alpha", type=float, default=0.016)
+    parser.add_argument("--alpha", type=float, default=0.032)
     parser.add_argument("--carrier_dir", type=str, default=None,
                         help="载体图像目录 (默认纯白)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--image_width", type=int, default=1920)
     parser.add_argument("--image_height", type=int, default=1080)
     parser.add_argument("--no_noise", action="store_true", help="不加噪声")
-    parser.add_argument("--channel_mode", type=str, default="cb", choices=["b", "cb"],
-                        help="嵌入域: b=B通道(黄/白), cb=Cb/Cr通道(色度)")
+    parser.add_argument("--channel_mode", type=str, default="b",
+                        choices=["b", "yw"],
+                        help="嵌入域: b/yw=黄白RGB(模板0/255)")
     parser.add_argument("--carrier_path", type=str, default=None,
                         help="单张载体图像路径 (优先于 carrier_dir)")
     args = parser.parse_args()

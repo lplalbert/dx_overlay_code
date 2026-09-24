@@ -2,7 +2,13 @@
 v1-vv1: 独立识别 + U-Net 语义分割
 
 多数据集训练，参考 fftmask/train_cb_v18_pair.py 风格。
-支持 /data1/lpl/datasets 下所有子目录的 train/val 自动发现。
+支持 /data1/lpl/datasets_labeled/{clean,noisy} 下所有子目录的 train/val 自动发现。
+
+两阶段训练 (推荐): config 里给 `stages`, 先 clean 预训练再 noisy 微调:
+    stages:
+      - {name: clean_pretrain,  data_root: .../clean, epochs: 10, lr: 0.001}
+      - {name: noisy_finetune,  data_root: .../noisy, epochs: 50, lr: 0.0005}
+不给 `stages` 则退回单阶段 (data_root + epochs + lr)。
 
 用法:
     python train.py --config config.yaml
@@ -13,6 +19,7 @@ import argparse
 import json
 import logging
 import os
+import random
 import sys
 import time
 from datetime import datetime
@@ -93,6 +100,114 @@ def validate(model, val_loader, device, threshold=0.5):
     return {'iou': iou, 'dice': dice, 'precision': precision, 'recall': recall}
 
 
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def build_loaders(data_root, image_size, batch_size, num_workers,
+                  train_length=0, val_length=0, seed=42):
+    """按 data_root 构建 train/val DataLoader。"""
+    logger.info(f"Discovering datasets in: {data_root}")
+    train_dataset = build_multi_dataset(data_root, split='train', task='segmentation',
+                                        image_size=image_size)
+    val_dataset = build_multi_dataset(data_root, split='val', task='segmentation',
+                                      image_size=image_size)
+
+    if train_length > 0 and len(train_dataset) > train_length:
+        indices = np.random.RandomState(seed).choice(
+            len(train_dataset), train_length, replace=False)
+        train_dataset = torch.utils.data.Subset(train_dataset, indices)
+    if val_length > 0 and len(val_dataset) > val_length:
+        indices = np.random.RandomState(seed + 1).choice(
+            len(val_dataset), val_length, replace=False)
+        val_dataset = torch.utils.data.Subset(val_dataset, indices)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                              num_workers=num_workers, pin_memory=True, drop_last=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                            num_workers=num_workers, pin_memory=True)
+    logger.info(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
+    return train_loader, val_loader
+
+
+def train_one_stage(model, stage, train_loader, val_loader, device,
+                    output_dir, base_cfg, global_epoch0):
+    """跑一个阶段, 返回 (best_dice, best_epoch_global, epochs_done)。"""
+    name = stage['name']
+    epochs = int(stage.get('epochs', base_cfg.get('epochs', 100)))
+    lr = float(stage.get('lr', base_cfg.get('lr', 0.001)))
+    weight_decay = float(base_cfg.get('weight_decay', 1e-4))
+    save_every = int(stage.get('save_every', base_cfg.get('save_every', 10)))
+    tag = stage.get('tag', name)
+
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info(f"STAGE [{name}]  epochs={epochs}  lr={lr}  tag={tag}")
+    logger.info("=" * 60)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+
+    best_dice, best_epoch_g = 0.0, global_epoch0
+    for e in range(epochs):
+        g_epoch = global_epoch0 + e + 1
+        model.train()
+        total_loss = 0.0
+        start_time = time.time()
+
+        pbar = tqdm(train_loader, desc=f"[{name}] {e+1}/{epochs}")
+        for images, masks in pbar:
+            images = images.to(device)
+            masks = masks.to(device)
+
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = bce_dice_loss(outputs, masks)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
+            total_loss += loss.item()
+            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+
+        avg_loss = total_loss / max(len(train_loader), 1)
+        val_metrics = validate(model, val_loader, device)
+        scheduler.step()
+        epoch_time = time.time() - start_time
+
+        logger.info(f"Epoch {g_epoch} [{name} {e+1}/{epochs}] [{epoch_time:.1f}s]")
+        logger.info(f"  Train Loss: {avg_loss:.4f}")
+        logger.info(f"  Val Dice: {val_metrics['dice']:.4f}  IoU: {val_metrics['iou']:.4f}  "
+                    f"P: {val_metrics['precision']:.4f}  R: {val_metrics['recall']:.4f}")
+
+        if val_metrics['dice'] > best_dice:
+            best_dice = val_metrics['dice']
+            best_epoch_g = g_epoch
+            torch.save({
+                'stage': name, 'epoch': g_epoch, 'stage_epoch': e + 1,
+                'model': model.state_dict(), 'optimizer': optimizer.state_dict(),
+                'val_dice': best_dice, 'val_metrics': val_metrics,
+            }, os.path.join(output_dir, f'best_model_{tag}.pth'))
+            logger.info(f"  ✓ Best [{name}] saved (dice={best_dice:.4f})")
+
+        if (e + 1) % save_every == 0 or (e + 1) == epochs:
+            torch.save({
+                'stage': name, 'epoch': g_epoch, 'stage_epoch': e + 1,
+                'model': model.state_dict(), 'optimizer': optimizer.state_dict(),
+                'val_metrics': val_metrics, 'best_dice': best_dice,
+            }, os.path.join(output_dir, f'checkpoint_{tag}_epoch_{e+1}.pth'))
+
+    # 阶段收尾: 保留一份最终权重
+    torch.save({'stage': name, 'epoch': global_epoch0 + epochs,
+                'model': model.state_dict()},
+               os.path.join(output_dir, f'last_{tag}.pth'))
+    logger.info(f"STAGE [{name}] done  best_dice={best_dice:.4f} @ epoch {best_epoch_g}")
+    return best_dice, best_epoch_g, epochs
+
+
 def main():
     parser = argparse.ArgumentParser(description='v1-vv1 U-Net 训练 (独立识别)')
     parser.add_argument('--config', type=str, required=True, help='配置文件路径')
@@ -117,33 +232,29 @@ def main():
     logger.info(f"Output: {output_dir}")
     logger.info(f"Device: {device}")
 
-    # ── 数据集 ──
-    data_root = cfg.get('data_root', '/data1/lpl/datasets')
+    # ── 训练阶段 (默认两阶段: clean 预训练 → noisy 微调) ──
+    seed = int(cfg.get('seed', 42))
+    set_seed(seed)
+
+    stages = cfg.get('stages')
+    if not stages:
+        # 兼容单阶段旧配置
+        stages = [{
+            'name': 'single',
+            'data_root': cfg.get('data_root', '/data1/lpl/datasets_labeled/noisy'),
+            'epochs': cfg.get('finetune', {}).get('epochs', cfg.get('epochs', 100)),
+            'lr': cfg.get('finetune', {}).get('lr', cfg.get('lr', 0.001)),
+        }]
+        logger.info(f"Single-stage mode (no `stages` in config): {stages[0]['name']}")
+
     image_size = (cfg.get('image_height', 1080), cfg.get('image_width', 1920))
-
-    logger.info(f"Discovering datasets in: {data_root}")
-    train_dataset = build_multi_dataset(data_root, split='train', task='segmentation', image_size=image_size)
-    val_dataset = build_multi_dataset(data_root, split='val', task='segmentation', image_size=image_size)
-
-    train_length = cfg.get('train_length', 0)
-    val_length = cfg.get('val_length', 0)
-    if train_length > 0 and len(train_dataset) > train_length:
-        indices = np.random.choice(len(train_dataset), train_length, replace=False)
-        train_dataset = torch.utils.data.Subset(train_dataset, indices)
-    if val_length > 0 and len(val_dataset) > val_length:
-        indices = np.random.choice(len(val_dataset), val_length, replace=False)
-        val_dataset = torch.utils.data.Subset(val_dataset, indices)
-
     batch_size = cfg.get('batch_size', 4)
     num_workers = cfg.get('num_workers', 4)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                              num_workers=num_workers, pin_memory=True, drop_last=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
-                            num_workers=num_workers, pin_memory=True)
-    logger.info(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
+    train_length = cfg.get('train_length', 0)
+    val_length = cfg.get('val_length', 0)
 
     # ── 模型 ──
-    model = UNet(n_channels=1, n_classes=1, bilinear=True).to(device)
+    model = UNet(n_channels=3, n_classes=1, bilinear=True).to(device)
 
     finetune_cfg = cfg.get('finetune', {})
     weight_path = finetune_cfg.get('weight_path')
@@ -156,88 +267,41 @@ def main():
         model.load_state_dict(state_dict, strict=False)
         logger.info("Weights loaded")
 
-    epochs = finetune_cfg.get('epochs', cfg.get('epochs', 100))
-    lr = finetune_cfg.get('lr', cfg.get('lr', 0.001))
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr,
-                                   weight_decay=cfg.get('weight_decay', 1e-4))
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
-    save_every = cfg.get('save_every', 10)
-
     # ── 训练 ──
-    best_dice = 0.0
-    best_epoch = 0
-
     logger.info("\nStarting training...")
+    logger.info(f"Stages: {[s['name'] for s in stages]}")
     logger.info("-" * 60)
 
-    for epoch in range(epochs):
-        model.train()
-        total_loss = 0
-        start_time = time.time()
+    stage_summary = []
+    global_epoch = 0
+    for si, stage in enumerate(stages):
+        train_loader, val_loader = build_loaders(
+            stage['data_root'], image_size, batch_size, num_workers,
+            train_length=train_length, val_length=val_length, seed=seed + si * 10)
+        best_dice, best_epoch_g, n_ep = train_one_stage(
+            model, stage, train_loader, val_loader, device,
+            output_dir, cfg, global_epoch)
+        global_epoch += n_ep
+        stage_summary.append({
+            'name': stage['name'], 'data_root': stage['data_root'],
+            'epochs': n_ep, 'best_dice': float(best_dice),
+            'best_epoch': best_epoch_g,
+            'train_samples': len(train_loader.dataset),
+            'val_samples': len(val_loader.dataset),
+        })
 
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
-        for images, masks in pbar:
-            images = images.to(device)
-            masks = masks.to(device)
-
-            optimizer.zero_grad()
-            outputs = model(images)
-            loss = bce_dice_loss(outputs, masks)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-
-            total_loss += loss.item()
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-
-        avg_loss = total_loss / max(len(train_loader), 1)
-        val_metrics = validate(model, val_loader, device)
-        scheduler.step()
-        epoch_time = time.time() - start_time
-
-        logger.info(f"Epoch {epoch+1}/{epochs} [{epoch_time:.1f}s]")
-        logger.info(f"  Train Loss: {avg_loss:.4f}")
-        logger.info(f"  Val Dice: {val_metrics['dice']:.4f}  IoU: {val_metrics['iou']:.4f}  "
-                     f"P: {val_metrics['precision']:.4f}  R: {val_metrics['recall']:.4f}")
-
-        # 保存最佳
-        if val_metrics['dice'] > best_dice:
-            best_dice = val_metrics['dice']
-            best_epoch = epoch + 1
-            torch.save({
-                'epoch': epoch + 1,
-                'model': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'val_dice': best_dice,
-                'val_metrics': val_metrics,
-            }, os.path.join(output_dir, 'best_model.pth'))
-            logger.info(f"  ✓ Best model saved (dice={best_dice:.4f})")
-
-        # 定期保存
-        if (epoch + 1) % save_every == 0:
-            torch.save({
-                'epoch': epoch + 1,
-                'model': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'val_metrics': val_metrics,
-                'best_dice': best_dice,
-                'best_epoch': best_epoch,
-            }, os.path.join(output_dir, f'checkpoint_epoch_{epoch+1}.pth'))
-            logger.info(f"  ✓ Checkpoint saved: epoch_{epoch+1}")
-
-    # ── 保存结果 ──
+    # ── 保存结果 (在最后阶段的 val 上评一次) ──
     final_metrics = validate(model, val_loader, device)
-    torch.save({'epoch': epochs, 'model': model.state_dict()},
+    torch.save({'epoch': global_epoch, 'model': model.state_dict()},
                os.path.join(output_dir, 'final_model.pth'))
 
+    best_overall = max(stage_summary, key=lambda s: s['best_dice']) if stage_summary else {}
     results = {
-        'best_epoch': best_epoch,
-        'best_dice': float(best_dice),
+        'stages': stage_summary,
+        'best_epoch': best_overall.get('best_epoch'),
+        'best_dice': best_overall.get('best_dice'),
         'final_metrics': {k: float(v) for k, v in final_metrics.items()},
-        'total_epochs': epochs,
-        'train_samples': len(train_dataset),
-        'val_samples': len(val_dataset),
+        'total_epochs': global_epoch,
         'config': cfg,
     }
     with open(os.path.join(output_dir, 'results.json'), 'w', encoding='utf-8') as f:
@@ -245,7 +309,9 @@ def main():
 
     logger.info("\n" + "=" * 60)
     logger.info("Training complete!")
-    logger.info(f"Best epoch: {best_epoch}, Best dice: {best_dice:.4f}")
+    for s in stage_summary:
+        logger.info(f"  [{s['name']}] best_dice={s['best_dice']:.4f} @ epoch {s['best_epoch']}  "
+                    f"({s['epochs']} ep, {s['train_samples']} train / {s['val_samples']} val)")
     logger.info(f"Final: {final_metrics}")
     logger.info(f"Output: {output_dir}")
     logger.info("=" * 60)

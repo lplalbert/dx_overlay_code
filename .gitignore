@@ -58,3 +58,13 @@ Thumbs.db
 output/
 runs/
 wandb/
+*.log
+*.meta.json
+
+# 可视化输出 (可由脚本重新生成)
+vis/
+
+# 模型权重 (体积大, 训练产物)
+*.pt
+*.pth
+watermark_locator/v1/weights/

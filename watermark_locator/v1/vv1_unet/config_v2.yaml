@@ -1,0 +1,39 @@
+# v1-vv1 v2: 在 v1 权重基础上, 用 3-noise 数据集续训 50 轮
+# 噪声: wechat / pimog / pimog_wechat 各加一遍
+
+stages:
+  - name: noisy_3noise_finetune
+    data_root: /data1/lpl/datasets_labeled_3noise/noisy
+    epochs: 50
+    lr: 0.0005
+
+data_root: /data1/lpl/datasets_labeled_3noise/noisy
+
+image_height: 540
+image_width: 960
+
+device: "0"
+
+output_dir: output/v1_vv1_unet_v2
+
+# 从 v1 noisy_finetune 的 best 权重续训
+finetune:
+  weight_path: /data1/lpl/dx_overlay_code/watermark_locator/v1/vv1_unet/output/v1_vv1_unet/best_model_noisy_finetune.pth
+
+batch_size: 4
+num_workers: 4
+lr: 0.0005
+weight_decay: 0.0001
+epochs: 50
+save_every: 10
+seed: 42
+
+train_length: 0
+val_length: 0
+
+noise_config:
+  train_noise:
+    - type: "wechat"
+    - type: "pimog"
+    - type: "pimog_wechat"
+  val_noise: "none"

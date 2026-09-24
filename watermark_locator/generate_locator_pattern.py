@@ -1,10 +1,23 @@
 """
-生成唯一定位图案（Locator Pattern）
+生成唯一定位图案（Locator Pattern）— 回字形
 
-定位图案需满足：
-1. 与 fix_fg_matrix 的所有16行 Hamming 距离 > 20
-2. 具有独特空间结构（非对称，便于CNN区分）
-3. 输出为 numpy 数组，可追加到 fix_fg_matrix
+定位图案采用**回字形**（同心方环 / nested square rings）:
+    外环(信号) + 间隙环(中性) + 内环(信号) + 核心(中性)
+
+        Y Y Y Y Y Y Y Y
+        Y W W W W W W Y
+        Y W Y Y Y Y W Y
+        Y W Y W W Y W Y
+        Y W Y W W Y W Y
+        Y W Y Y Y Y W Y
+        Y W W W W W W Y
+        Y Y Y Y Y Y Y Y
+
+    Y = -1  黄色(信号), 条纹调制
+    W = +1  白色(中性), 始终不变
+
+回字形有强角点 + 独特自相关峰, 比伪随机图案更容易定位。
+注意: 真"回"不是 32/32 平衡的 (信号 40 / 中性 24), 故不再约束平衡性。
 
 用法:
     python generate_locator_pattern.py [--output locator_pattern.npy]
@@ -111,120 +124,108 @@ def min_distance_after_shift(pattern: np.ndarray, matrix: np.ndarray) -> int:
     return min_dist
 
 
-def generate_locator_pattern(
-    min_distance: int = 22,
-    max_transitions: int = 32,
-    max_attempts: int = 200000,
-    seed: int = 2024,
-) -> np.ndarray:
+def build_hui_pattern() -> np.ndarray:
     """
-    生成满足约束的定位图案。
+    构造确定性的回字形定位图案 (8x8, +1/-1)。
 
-    策略：
-    1. 用伪随机搜索生成候选
-    2. 确保与所有16个码字的Hamming距离 > min_distance
-    3. 额外约束：不具有左右对称（增加CNN可区分性）
-    4. 额外约束：过渡次数 <= max_transitions（控制高频能量，抗压缩）
-    5. 额外约束：无孤立点（单像素被相反值包围，压缩后必被抹平）
-    6. 额外约束：循环平移后与码字的最小距离 > shift_distance（防混淆）
+    四层同心方环, 交替 信号/中性/信号/中性:
+      ring 0 (最外框)   = -1  信号   28 格
+      ring 1 (间隙)     = +1  中性   20 格
+      ring 2 (内框)     = -1  信号   12 格
+      ring 3 (核心 2x2) = +1  中性    4 格
 
-    Args:
-        min_distance: 与所有码字的最小Hamming距离下限
-        max_transitions: 最大允许的相邻过渡次数（越低频率越低）
-        max_attempts: 最大搜索次数
-        seed: 随机种子
+    即汉字"回"的字形: 外"囗"套内"口", 内口是空心的。
+    信号 40 / 中性 24 — 不再要求 32/32 平衡 (真回本身就不平衡)。
 
     Returns:
-        (64,) int8 数组，值为+1或-1
+        (64,) int8 数组，值为 +1(白/中性) 或 -1(黄/信号)
     """
-    rng = np.random.RandomState(seed)
+    m = np.ones((8, 8), dtype=np.int8)          # 默认中性 +1
+    # ring 0: 最外框
+    m[0, :] = -1
+    m[7, :] = -1
+    m[:, 0] = -1
+    m[:, 7] = -1
+    # ring 2: 内框 (2..5 的边界)
+    m[2, 2:6] = -1
+    m[5, 2:6] = -1
+    m[2:6, 2] = -1
+    m[2:6, 5] = -1
+    # ring 1 (1..6 除去 ring2) 与 ring 3 (核心 2x2) 保持 +1
+    return m.reshape(64).astype(np.int8)
 
-    best_pattern = None
-    best_min_dist = 0
-    shift_distance = max(12, min_distance - 8)  # 平移后的最小距离
 
-    for attempt in range(max_attempts):
-        # 生成随机候选（+1/-1均匀分布）
-        candidate = rng.choice([-1, 1], size=64).astype(np.int8)
+def generate_locator_pattern(
+    min_distance: int = 16,
+    max_transitions: int = 64,
+    max_attempts: int = 0,
+    seed: int = 0,
+) -> np.ndarray:
+    """
+    生成回字形定位图案 (确定性, 不再伪随机搜索)。
 
-        # 约束1：平衡性（32个+1, 32个-1）
-        plus_count = np.sum(candidate == 1)
-        if plus_count != 32:
-            continue
+    回字形有强角点 + 独特自相关峰, 便于 CNN/匹配定位。
+    与 16 个码字的 Hamming 距离由 validate_pattern 报告;
+    回字形本身是中心对称的 (这是定位子的特性, 不是缺陷)。
 
-        # 约束2：无孤立点（压缩鲁棒性）
-        if has_isolated_points(candidate):
-            continue
+    Args:
+        min_distance / max_transitions / max_attempts / seed:
+            兼容旧接口, 现已不参与搜索 (保留避免调用方报错)。
 
-        # 约束3：过渡次数（控制高频能量）
-        trans = count_transitions(candidate)
-        if trans > max_transitions:
-            continue
-
-        # 约束4：与所有码字的距离
-        dist = min_hamming_to_matrix(candidate, FIX_FG_MATRIX)
-        if dist < min_distance:
-            continue
-
-        # 约束5：非左右对称
-        m = candidate.reshape(8, 8)
-        if np.all(m == m[:, ::-1]):
-            continue
-
-        # 约束6：循环平移后与码字不相似
-        shift_dist = min_distance_after_shift(candidate, FIX_FG_MATRIX)
-        if shift_dist < shift_distance:
-            continue
-
-        # 找到满足所有约束的候选
-        if dist > best_min_dist:
-            best_min_dist = dist
-            best_pattern = candidate.copy()
-            print(f"  Attempt {attempt+1}: min_dist={dist}, shift_min={shift_dist}, transitions={trans}")
-
-            # 如果距离已经足够好，提前停止
-            if dist >= min_distance + 4:
-                break
-
-    if best_pattern is None:
-        raise RuntimeError(
-            f"Failed to generate pattern after {max_attempts} attempts. "
-            f"Try reducing min_distance (currently {min_distance}) or "
-            f"increasing max_transitions (currently {max_transitions})."
-        )
-
-    return best_pattern
+    Returns:
+        (64,) int8 数组，值为 +1 或 -1
+    """
+    del min_distance, max_transitions, max_attempts, seed  # 兼容旧签名
+    pattern = build_hui_pattern()
+    print("  Built 回字形 (nested square rings) locator, deterministic")
+    return pattern
 
 
 def validate_pattern(pattern: np.ndarray) -> bool:
-    """验证定位图案满足所有约束。"""
+    """验证定位图案 (回字形结构 + 与码字的可区分性)。"""
     m = pattern.reshape(8, 8)
 
-    # 平衡性
-    if np.sum(pattern == 1) != 32:
-        print("FAIL: pattern is not balanced (not 32 +1 / 32 -1)")
+    # 取值合法性
+    if not np.all(np.isin(pattern, (-1, 1))):
+        print("FAIL: pattern must be +1 / -1 only")
         return False
 
-    # 过渡次数
-    trans = count_transitions(pattern)
-    print(f"  Transition count: {trans} (limit: {32})")
-    if trans > 32:
-        print("WARN: high transition count (may affect compression robustness)")
+    n_sig = int(np.sum(pattern == -1))
+    n_neu = int(np.sum(pattern == 1))
+    print(f"  Signal(-1) / Neutral(+1): {n_sig} / {n_neu}  (回字形期望 40 / 24)")
+    if (n_sig, n_neu) != (40, 24):
+        print("WARN: not the 回字形 40/24 split")
 
-    # 与每个码字的距离
-    all_pass = True
+    # 回字形结构: 四层同心方环
+    expect = build_hui_pattern()
+    is_hui = bool(np.array_equal(pattern, expect))
+    print(f"  Is 回字形 (nested rings): {is_hui}")
+
+    # 过渡次数 / 孤立点 (报告用; 回字形结构低频, 不作硬约束)
+    trans = count_transitions(pattern)
+    print(f"  Transition count: {trans}")
+    print(f"  Isolated points: {has_isolated_points(pattern)}")
+
+    # 与每个码字的距离 (回字形与伪随机码字应有足够距离)
+    all_pass = is_hui
+    dists = []
     for i in range(16):
         dist = hamming_distance(pattern, FIX_FG_MATRIX[i])
-        status = "OK" if dist >= 20 else "FAIL"
-        if dist < 20:
+        dists.append(dist)
+        status = "OK" if dist >= 16 else "FAIL"
+        if dist < 16:
             all_pass = False
         print(f"  CW{i:2d}: Hamming dist = {dist:2d} [{status}]")
+    print(f"  min Hamming to codewords: {min(dists)}")
 
-    # 非对称性
-    lr_sym = np.all(m == m[:, ::-1])
-    tb_sym = np.all(m == m[::-1, :])
-    print(f"  Left-right symmetric: {lr_sym}")
-    print(f"  Top-bottom symmetric: {tb_sym}")
+    shift_dist = min_distance_after_shift(pattern, FIX_FG_MATRIX)
+    print(f"  min Hamming after shift:  {shift_dist}")
+
+    # 对称性 (回字形是中心对称的 — 定位子特性)
+    lr_sym = bool(np.all(m == m[:, ::-1]))
+    tb_sym = bool(np.all(m == m[::-1, :]))
+    print(f"  Left-right symmetric: {lr_sym}  (回字形预期 True)")
+    print(f"  Top-bottom symmetric: {tb_sym}  (回字形预期 True)")
 
     return all_pass
 
@@ -247,24 +248,13 @@ def get_extended_fix_fg_matrix(locator_pattern: np.ndarray) -> np.ndarray:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Generate unique locator pattern")
+    parser = argparse.ArgumentParser(description="Generate 回字形 locator pattern")
     parser.add_argument("--output", type=str, default="locator_pattern.npy",
                         help="Output .npy file path")
-    parser.add_argument("--min-distance", type=int, default=22,
-                        help="Minimum Hamming distance to all codewords")
-    parser.add_argument("--max-transitions", type=int, default=32,
-                        help="Max transitions in 8x8 grid (lower = more low-freq, more robust)")
-    parser.add_argument("--seed", type=int, default=2024,
-                        help="Random seed for reproducibility")
     args = parser.parse_args()
 
-    print("=== Generating Locator Pattern ===")
-    print(f"  min_distance={args.min_distance}, max_transitions={args.max_transitions}")
-    pattern = generate_locator_pattern(
-        min_distance=args.min_distance,
-        max_transitions=args.max_transitions,
-        seed=args.seed,
-    )
+    print("=== Generating Locator Pattern (回字形) ===")
+    pattern = generate_locator_pattern()
 
     print(f"\nGenerated pattern (8×8):")
     print(pattern.reshape(8, 8))

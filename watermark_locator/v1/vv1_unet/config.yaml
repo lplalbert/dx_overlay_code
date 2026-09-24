@@ -1,35 +1,51 @@
 # v1-vv1: 独立识别 + U-Net 分割
 # 多数据集训练配置
 
-# 数据集根目录 (下所有子目录的 train/val 会被自动发现)
-data_root: /data1/lpl/datasets
+# ── 两阶段训练 (推荐): clean 预训练 → noisy 微调 ──
+# 后一阶段继承前一阶段的权重 (同一个 model 实例继续训)。
+# 不写 stages 则退回单阶段 (用下面的 data_root / epochs / lr)。
+stages:
+  - name: clean_pretrain
+    data_root: /data1/lpl/datasets_labeled/clean
+    epochs: 10
+    lr: 0.001
+  - name: noisy_finetune
+    data_root: /data1/lpl/datasets_labeled/noisy
+    epochs: 50
+    lr: 0.0005
 
-# 图像尺寸
-image_height: 1080
-image_width: 1920
+# 单阶段回退用的数据根目录 (下所有子目录的 train/val 会被自动发现)
+# noisy=pair 噪声版 (训练定位器用这个); clean=纯净水印版在 .../clean
+data_root: /data1/lpl/datasets_labeled/noisy
+
+# 网络输入尺寸 (加载时从 1920x1080 降采; 条纹 period=4, 2x 以内可保 cell 结构)
+# 1080x1920 训练 bs=1 就要 11.5GB, bs=2 OOM — 用 540x960 bs=4 同样 11.5GB
+image_height: 540
+image_width: 960
+
+device: "1"
 
 # 输出目录
 output_dir: output/v1_vv1_unet
 
-# 预训练权重 (可选)
+# 预训练权重 (可选; stages 第一阶段开始前加载)
 finetune:
   weight_path: null  # e.g., checkpoints/v1_vv1_unet_epoch50.pth
-  epochs: 100
-  lr: 0.0001
 
-# 训练参数
+# 训练参数 (stages 里给了 lr/epochs 就以 stages 为准; 下面是单阶段回退默认)
 batch_size: 4
 num_workers: 4
 lr: 0.001
 weight_decay: 0.0001
-epochs: 100
+epochs: 50
 save_every: 10
+seed: 42
 
 # 数据限制 (0=不限)
 train_length: 0
 val_length: 0
 
-# 噪声配置 (数据加载时在线增强)
+# 噪声配置 (记录用, 实际噪声在数据集生成时已应用到 noisy 树)
 noise_config:
   train_noise:
     - type: "pair"
