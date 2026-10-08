@@ -39,6 +39,8 @@ from generate_dataset import (
     generate_one_sample,
     add_wechat_noise,
     add_pimog_noise,
+    apply_noise_tier,
+    NOISE_TIERS,
     build_canvas,
     pick_canvas_grid,
     get_locator_positions,
@@ -55,6 +57,10 @@ NOISE_VARIANTS = [
     ('wechat',       '单独微信压缩',   False),
     ('pimog',        '单独模拟拍照',   True),
     ('pimog_wechat', '拍照后微信压缩', True),
+    ('n1',           '档位1 轻',       True),
+    ('n2',           '档位2 中',       True),
+    ('n3',           '档位3 重',       True),
+    ('n4',           '档位4 极重',     True),
 ]
 
 NOISE_SOURCES = {
@@ -62,11 +68,15 @@ NOISE_SOURCES = {
     'pimog':        'physical_moire.py:preset=screen_capture',
     'pimog_wechat': 'physical_moire.py:screen_capture -> wechat_worst_case_compressor.py:mainstream_worst',
 }
+for _k, _t in NOISE_TIERS.items():
+    NOISE_SOURCES[_k] = f'NOISE_TIERS[{_k}] {_t["desc"]}  (标定残余 {_t["residue"]}, 频段std {_t["band_std"]})'
 
 
 def apply_noise_variant(image, mask, bboxes, kind, rng):
     """按 kind 调用 generate_dataset 里已实现的噪声函数。"""
-    if kind == 'wechat':
+    if kind in NOISE_TIERS:
+        return apply_noise_tier(image, mask, bboxes, kind, rng)
+    elif kind == 'wechat':
         return add_wechat_noise(image), mask, bboxes
     elif kind == 'pimog':
         return add_pimog_noise(image, mask, bboxes, rng=rng)
@@ -167,7 +177,9 @@ def _pick_sources(files, images_dir, n_need, rng, cell_h, cell_w, max_try=30):
 
 
 def generate_for_dataset(info, split, out_root, n_take, alpha, rng,
-                         locator_pattern, channel_mode, log):
+                         locator_pattern, channel_mode, log,
+                         noise_variants=None):
+    variants = NOISE_VARIANTS if noise_variants is None else noise_variants
     images_dir = info.get(f'{split}_images')
     if images_dir is None:
         return {}
@@ -225,8 +237,8 @@ def generate_for_dataset(info, split, out_root, n_take, alpha, rng,
 
         _save_sample(clean_dirs, stem, clean_img, mask, bboxes)
 
-        # ── 2) 三种噪声各加一遍 ──
-        for noise_tag, noise_cn, need_rng in NOISE_VARIANTS:
+        # ── 2) 噪声变体各加一遍 ──
+        for noise_tag, noise_cn, need_rng in variants:
             # pimog 每次调用需要独立 rng 状态以获得不同的透视参数
             noise_rng = np.random.RandomState(rng.randint(0, 2 ** 31 - 1))
             noisy_img, mask_n, bboxes_n = apply_noise_variant(
@@ -240,7 +252,7 @@ def generate_for_dataset(info, split, out_root, n_take, alpha, rng,
         if (i + 1) % 20 == 0 or (i + 1) == n_samples:
             dt = time.time() - t0
             log(f'  [{ds_name}/{split}] {i + 1}/{n_samples}  '
-                f'{dt / (i + 1):.2f}s/img  (3 noisy variants each)')
+                f'{dt / (i + 1):.2f}s/img  ({len(variants)} noisy variants each)')
 
     return {'n': n_done, 'noise_hist': noise_hist,
             'src_per_canvas': n_need, 'grid': [cols, rows],
@@ -258,18 +270,29 @@ def main():
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--channel_mode', default='b', choices=['b', 'yw'])
     parser.add_argument('--wechat_preset', default='mainstream_worst')
+    parser.add_argument('--noise_kinds', default='n1,n2,n3,n4',
+                        help='逗号分隔的噪声变体; 可选 wechat,pimog,pimog_wechat,'
+                             'n1,n2,n3,n4 (n1..n4 = 标定过的非几何噪声档位,'
+                             '每个 clean 样本各出一份)')
     args = parser.parse_args()
+
+    known = {t: (cn, rngf) for t, cn, rngf in NOISE_VARIANTS}
+    variants = []
+    for tag in [s.strip() for s in args.noise_kinds.split(',') if s.strip()]:
+        if tag not in known:
+            raise SystemExit(f'--noise_kinds: 未知变体 {tag!r}, 可选 {sorted(known)}')
+        variants.append((tag, known[tag][0], known[tag][1]))
 
     log = print
     log('=' * 60)
-    log('prepare_multids_3noise: tile canvas -> clean + 3-noise variants')
+    log('prepare_multids_3noise: tile canvas -> clean + noise variants')
     log('=' * 60)
     log(f'carriers : {args.data_root}')
     log(f'output   : {args.output_root}')
     log(f'alpha    : {args.alpha}  channel={args.channel_mode}')
     log(f'canvas   : tile (NO resize) -> {SCREEN_W}x{SCREEN_H}')
-    log(f'noise    : 3 variants per clean sample:')
-    for tag, cn, _ in NOISE_VARIANTS:
+    log(f'noise    : {len(variants)} variants per clean sample:')
+    for tag, cn, _ in variants:
         log(f'  {tag:14s} {cn:12s}  ← {NOISE_SOURCES[tag]}')
     log(f'wechat   : {args.wechat_preset}  (wechat_worst_case_compressor.py)')
     log(f'photo    : screen_capture  (physical_moire.py)')
@@ -314,7 +337,8 @@ def main():
         for split, n_take in (('train', n_train), ('val', n_val)):
             counts[split] = generate_for_dataset(
                 info, split, args.output_root, n_take, args.alpha, rng,
-                locator_pattern, args.channel_mode, log)
+                locator_pattern, args.channel_mode, log,
+                noise_variants=variants)
         summary[ds_name] = counts
         log(f'[{ds_name}] generated '
             f'train={counts.get("train", {}).get("n", 0)} '
@@ -357,7 +381,8 @@ def main():
             for v in counts.get(split, {}).get('noise_hist', {}).values():
                 total_noisy += v
         log(f'  {name:24s} clean train={tn:6d}  val={vn:6d}')
-    log(f'\nTotal: {total_clean} clean -> {total_noisy} noisy (3x)')
+    ratio = (f'{total_noisy / total_clean:.1f}x' if total_clean else 'n/a')
+    log(f'\nTotal: {total_clean} clean -> {total_noisy} noisy ({ratio})')
     log(f'clean -> {os.path.join(args.output_root, "clean")}')
     log(f'noisy -> {os.path.join(args.output_root, "noisy")}')
 

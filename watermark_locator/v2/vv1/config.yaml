@@ -1,0 +1,124 @@
+# ═══════════════════════════════════════════════════════════════════
+# v2-vv1：**零网络层改动** 的那一版
+#   model = 官方 yolov8n，拓扑见 vv1/model.yaml
+#   对照组是 vv2/（YOLOv12 区域注意力）
+# 用法:
+#   python train_yolo.py --config vv1/config.yaml
+#   python train_yolo.py --config vv1/config.yaml --device 0 --batch 8
+# ═══════════════════════════════════════════════════════════════════
+
+# ── 模型 ────────────────────────────────────────────────────────────
+# yolov8n.pt = COCO 预训练 (nc=80)，ultralytics 会按数据的 nc=1 自动换 Detect 头。
+# 想从头训做消融，把下面换成 `model: vv1/model.yaml`。
+model: vv1/yolov8n.pt
+
+# ── 数据：三个数据集，两阶段 ─────────────────────────────────────────
+#   1 clean    无噪声                        → datasets_v2/clean
+#   2 noisy    微信压缩 / 拍照模拟 /         → datasets_v2/noisy
+#              拍照后微信压缩（clean 每张各 1 份）
+#   3 cropped  上面两棵树各 1:1 裁剪后       → datasets_v2/cropped
+#              重框回 1920×1080
+# 全部已经是最终训练窗 (1920×1080)。尺度覆盖 s∈[0.5,2.2] 靠原生分辨率
+# 渲染 + 1:1 取景做进图里，不在 loader 里缩放。
+#
+# 生成顺序（先跑各自 --selftest 再批量；一次只跑一个训练作业，
+# /data1 是 IO 瓶颈不是 GPU）：
+#   python dataset/generate_dataset_v2.py --num_samples 4000 --no_noise \
+#       --carrier_root /data1/lpl/datasets \
+#       --output_dir /data1/lpl/datasets_v2/clean --jobs 8
+#   python dataset/prepare_noise_from_clean_v2.py \
+#       --clean_root /data1/lpl/datasets_v2/clean \
+#       --output_dir /data1/lpl/datasets_v2/noisy            # → wechat/pimog/pimog_wechat
+#   python dataset/prepare_crop_aug_v2.py \
+#       --src_root /data1/lpl/datasets_v2/clean \
+#       --src_root /data1/lpl/datasets_v2/noisy \
+#       --output_dir /data1/lpl/datasets_v2/cropped
+#   python dataset/write_stage_yaml.py \
+#       --clean ... --noisy ... --cropped ... --out_dir /data1/lpl/datasets_v2
+#
+# 裁剪树为什么也存 1920×1080：ultralytics `BaseDataset.load_image` 把长边
+# **无条件**缩到 imgsz（r = imgsz/max(h0,w0)，没有 min(r,1.0)），小图会被
+# 放大 —— 码字像素间距这个尺子和 4px 条纹周期一起毁掉。实测 500×400 在
+# train/val × rect 开/关下都是 3.84×。所以裁剪在**生成时**就重框回窗，
+# 让 loader 永远看到 r=1.0。详见 dataset/prepare_crop_aug_v2.py 文档串。
+data: /data1/lpl/datasets_v2/stage1.yaml
+
+# 两阶段：先 clean+noisy 打底，再 cropped 微调（打破码字格的位置先验，
+# 并让模型学会残缺码字）。train_yolo.py 自动把 stage1 的 best.pt 链给 stage2。
+stages:
+  - name: base
+    data: /data1/lpl/datasets_v2/stage1.yaml
+    epochs: 100
+    lr: 0.01
+    patience: 30
+  - name: finetune
+    data: /data1/lpl/datasets_v2/stage2.yaml
+    epochs: 40
+    # 打底权重已经会认码字，微调只补位置不变性 / 残缺码字 → 小 lr。
+    # 有效 batch 恒 64（nbs），lr 不随 batch 动。
+    lr: 0.002
+    patience: 20
+
+# ── 输入分辨率：这是个物理约束，不是超参 ────────────────────────────
+# imgsz 必须 ≥ 1920，且图片本来就是 1920×1080，于是 letterbox 的
+#   r = min(1920/1920, 1920/1080) = 1.0
+# **只 pad 不重采样**。条纹周期 4 px 是**渲染像素**周期，任何下采样都会混叠。
+#   imgsz=640 → r=1/3 → 条纹周期变 1.3 px，水印直接没了。
+# rect: true 让 letterbox 只 pad 到 stride 倍数 (1920×1088)，而不是撑成
+# 1920×1920 的方图 —— 同样 r=1.0，但省掉 44% 的无效算力。
+imgsz: 1920
+rect: true
+
+image_height: 1080
+image_width: 1920
+
+# ── 批与学习率 ──────────────────────────────────────────────────────
+# nbs=64 是**有效 batch**，ultralytics 按 accumulate=max(round(nbs/batch),1)
+# 累积梯度。改 batch_size 只是墙钟快慢，有效 batch 恒 64，
+# **lr 千万别跟着 batch 放大** —— 这是纯墙钟旋钮，不是超参。
+nbs: 64
+batch_size: 8
+optimizer: SGD          # 必须显式：optimizer=auto 会自己挑 lr 并**忽略 lr0**
+lr: 0.01
+weight_decay: 0.0005
+
+epochs: 100
+patience: 30
+save_every: 10
+seed: 42
+
+device: "0"
+
+# /data1 是机械/网络盘，worker 太少会饿死 GPU；太多只是互相抢寻道。
+workers: 16
+
+# channels_last: NHWC 布局，Ampere/Ada 上卷积免费提速，显存几乎不变。
+channels_last: true
+
+output_dir: output/v2_vv1
+
+# ── 增广：全部关掉，理由是物理的 ────────────────────────────────────
+# 常规增广在这里几乎全是**破坏性**的，因为模板的载体是渲染像素级的条纹：
+#   hsv_*   : 色度/亮度抖动 (v≈0.4) 直接盖过 ±4 级的水印调制
+#   scale   : 缩放会重采样 → 4px 条纹混叠；尺度多样性已由原生渲染 s∈[0.5,2.2] 提供
+#   fliplr  : 45° 条纹镜像后变成 135°，训练里根本没这个模式
+#   mosaic  : 每格要 resize/letterbox，重采样毁条纹
+#   translate/degrees/shear/perspective: 都是仿射重采样，同理
+# 位置多样性由数据侧提供：frame_to_window() 对大图随机 1:1 裁剪、
+# 小图 1:1 平铺后随机贴装，码字网格相对窗口的偏移是随机的。
+augment:
+  hsv_h: 0.0
+  hsv_s: 0.0
+  hsv_v: 0.0
+  degrees: 0.0
+  translate: 0.0
+  scale: 0.0
+  shear: 0.0
+  perspective: 0.0
+  flipud: 0.0
+  fliplr: 0.0
+  bgr: 0.0
+  mosaic: 0.0
+  mixup: 0.0
+  copy_paste: 0.0
+  erasing: 0.0

@@ -1,0 +1,86 @@
+# v1-vv2 v4: 在 v3 (crop_aug_finetune) 权重基础上, **放开尺度增广**续训
+#
+# 为什么要有这一版
+#   v3 用 pad_native 把定位块在 640 输入里钉死 53px, 尺度严格对齐部署口径,
+#   代价是模型没有尺度不变性 —— 实测工作带只有 0.5~1.5x:
+#       表观  1.0x (53px)  -> 78tp
+#             1.5x (80px)  -> 48tp     <- ultralytics 默认 scale=0.5 的上界
+#             2.0x (107px) ->  8tp
+#             2.5x+        ->  0tp
+#   局部特写/角标不全时定位块表观会 >1.5x, 就全漏。
+#
+#   v3 的尺度覆盖来自 ultralytics 默认 scale=0.5 (增益 0.5~1.5x), **不是**来自
+#   裁剪集 —— 裁剪是原生分辨率 cutout, 定位块恒 160px, pad_native s=1.0 不缩放。
+#   实测 13532 个 label: 89.7% 的定位块宽都在 150~170px。
+#
+#   本版只动增广: scale=(0.4, 2.2) 绝对倍率, 把工作带撑到 0.4~2.2x。
+#
+# 权重分版本
+#   output_dir 改成 v1_vv2_yolo_v4, run 名 yolo_scale_aug_finetune,
+#   与 v2 / v3 目录完全隔离, 不会互相覆盖。
+#
+# 数据: /data1/lpl/datasets_labeled_3noise_cropped/all   (与 v3 同一套裁剪增广集)
+#   ★ 必须配 SCALE_MODE=pad_native, 否则定位块被拉大 ~2x ★
+#   训练: SCALE_MODE=pad_native python train.py --config config_v4.yaml
+
+stages:
+  - name: scale_aug_finetune
+    tag: scale_aug_finetune
+    data_root: /data1/lpl/datasets_labeled_3noise_cropped/all
+    epochs: 100
+    lr: 0.003          # 增广分布变了, lr 比 v3 的 0.005 略降, 避免把已有能力冲掉
+    patience: 0        # 0 = 关闭早停, 跑满 100 轮
+    save_every: 10
+
+data_root: /data1/lpl/datasets_labeled_3noise_cropped/all
+
+image_height: 1080
+image_width: 1920
+
+# ★ 独立目录: 权重与 v2/v3 分开保存 ★
+output_dir: output/v1_vv2_yolo_v4
+
+# 从 v3 最终权重续训
+finetune:
+  weight_path: /data1/lpl/dx_overlay_code/runs/detect/output/v1_vv2_yolo_v3/yolo_crop_aug_finetune/weights/best.pt
+
+model: yolov8n.pt
+imgsz: 640
+
+# GPU 3 有别的任务在跑, 走空闲的 GPU 1
+device: "1"
+
+# batch 16 -> 64: 纯粹的墙钟加速, **不改变优化数学**, 所以 lr 必须保持 0.003。
+#   ultralytics 有 nbs=64 名义 batch, 自动梯度累积:
+#     batch 16 -> accumulate=4 -> 有效 batch 16*4 = 64, optimizer step 212 次/epoch
+#     batch 64 -> accumulate=1 -> 有效 batch 64*1 = 64, optimizer step 212 次/epoch
+#   有效 batch / 优化步数 / EMA 更新次数 / weight_decay 缩放 / lr 调度步数全部相同。
+#   收益纯粹来自 per-iteration 的 Python 固定开销 (取 batch+collate/日志/调度)
+#   从付 846 次/epoch 降到 212 次/epoch。
+#   实测 GPU 步: batch64 + channels_last = 52ms (vs batch16 28.5ms), 显存 6.6 GB (卡 23 GB)。
+batch_size: 64
+channels_last: true
+
+lr: 0.003          # 不随 batch 改 —— 有效 batch 恒为 64 (nbs 累积), 改了就是白加大步长
+epochs: 100
+patience: 0
+save_every: 10
+seed: 42
+
+# DataLoader worker 数。实测瓶颈是 **PNG 解码 CPU**, 不是盘:
+#   纯解码 46ms/张 (读+解码 44ms -> 盘被页缓存吸收, 几乎免费)
+#   12 worker = 261 张/s, 而 GPU 满载要 640 张/s -> GPU 只有 15%
+# 机器 64 核 load 仅 13, 有 ~51 核空闲。32 worker 解码产能 ~696 张/s, 喂得满 GPU。
+workers: 32
+
+train_length: 0
+val_length: 0
+
+# ── 增广覆盖 (train.py 逐项透传给 model.train) ──
+#   scale  元组 = 绝对倍率区间 (ultralytics 语义), float 才是增益 1±scale
+#   目标: 把定位块表观工作带从 0.5~1.5x 撑到 0.4~2.2x
+augment:
+  scale: [0.4, 2.2]
+  mosaic: 0.7          # 30% 不拼 mosaic, 保留整幅样本 (贴近部署的满幅输入)
+  translate: 0.15      # 略加强平移, 配合 pad_native 的随机落位
+  fliplr: 0.5          # 显式写出, 避免后续默认值变动

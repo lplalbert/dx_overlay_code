@@ -107,9 +107,25 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 
+def default_num_workers():
+    """DataLoader worker 数。太少则 GPU 等数据, 太多则互相抢 /data1 的寻道。"""
+    return min(16, max(4, (os.cpu_count() or 8) // 4))
+
+
 def build_loaders(data_root, image_size, batch_size, num_workers,
-                  train_length=0, val_length=0, seed=42):
-    """按 data_root 构建 train/val DataLoader。"""
+                  train_length=0, val_length=0, seed=42,
+                  prefetch_factor=4, persistent_workers=True):
+    """按 data_root 构建 train/val DataLoader。
+
+    prefetch_factor / persistent_workers 只在 num_workers>0 时合法 (PyTorch 硬约束),
+    必须按需省略, 不能无条件传 —— num_workers=0 时传了会直接抛 TypeError。
+
+    prefetch_factor: 每个 worker 预取几个 batch。IO 慢的盘上放大些能把解码延迟
+                     藏进前向; 占用 host 内存 = prefetch_factor * num_workers
+                     * batch_size 个样本。
+    persistent_workers: 跨 epoch 不重建 worker。多 epoch 长训练能省掉每轮的
+                        进程 spawn + 数据集重建开销。
+    """
     logger.info(f"Discovering datasets in: {data_root}")
     train_dataset = build_multi_dataset(data_root, split='train', task='segmentation',
                                         image_size=image_size)
@@ -125,11 +141,19 @@ def build_loaders(data_root, image_size, batch_size, num_workers,
             len(val_dataset), val_length, replace=False)
         val_dataset = torch.utils.data.Subset(val_dataset, indices)
 
+    extra = {}
+    if num_workers > 0:
+        extra['persistent_workers'] = persistent_workers
+        extra['prefetch_factor'] = prefetch_factor
+
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                              num_workers=num_workers, pin_memory=True, drop_last=True)
+                              num_workers=num_workers, pin_memory=True,
+                              drop_last=True, **extra)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
-                            num_workers=num_workers, pin_memory=True)
+                            num_workers=num_workers, pin_memory=True, **extra)
     logger.info(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
+    logger.info(f"DataLoader: workers={num_workers} prefetch_factor={extra.get('prefetch_factor', '-')} "
+                f"persistent_workers={extra.get('persistent_workers', '-')}")
     return train_loader, val_loader
 
 
@@ -249,7 +273,9 @@ def main():
 
     image_size = (cfg.get('image_height', 1080), cfg.get('image_width', 1920))
     batch_size = cfg.get('batch_size', 4)
-    num_workers = cfg.get('num_workers', 4)
+    num_workers = int(cfg.get('num_workers', default_num_workers()))
+    prefetch_factor = int(cfg.get('prefetch_factor', 4))
+    persistent_workers = bool(cfg.get('persistent_workers', True))
     train_length = cfg.get('train_length', 0)
     val_length = cfg.get('val_length', 0)
 
@@ -276,8 +302,11 @@ def main():
     global_epoch = 0
     for si, stage in enumerate(stages):
         train_loader, val_loader = build_loaders(
-            stage['data_root'], image_size, batch_size, num_workers,
-            train_length=train_length, val_length=val_length, seed=seed + si * 10)
+            stage['data_root'], image_size, batch_size,
+            int(stage.get('num_workers', num_workers)),
+            train_length=train_length, val_length=val_length, seed=seed + si * 10,
+            prefetch_factor=int(stage.get('prefetch_factor', prefetch_factor)),
+            persistent_workers=bool(stage.get('persistent_workers', persistent_workers)))
         best_dice, best_epoch_g, n_ep = train_one_stage(
             model, stage, train_loader, val_loader, device,
             output_dir, cfg, global_epoch)

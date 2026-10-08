@@ -189,13 +189,16 @@ def _get_wechat_compressor(preset=None):
     return _WECHAT_COMPRESSOR
 
 
-def add_wechat_noise(image, preset=None):
+def add_wechat_noise(image, preset=None, quality=None, blur_radius=None,
+                     subsampling=None):
     """微信最坏情况压缩 — 复用 wechat_worst_case_compressor.py。
 
     流程 (与参考实现一致):
       1. 短边缩到 1280 (4:3 图缩到 1706x1279); 1920x1080 短边 1080 < 1280 → 不缩
       2. GaussianBlur radius=0.6
       3. 真 JPEG 编解码: IJG 标准亮度/色度量化表按 quality=60 缩放, 4:2:0 子采样
+
+    quality / blur_radius / subsampling 给出时覆盖 preset 的对应项 (见 NOISE_TIERS)。
 
     非几何 (输出画布与输入一致), mask/bbox 无需改动。
     """
@@ -205,7 +208,19 @@ def add_wechat_noise(image, preset=None):
         image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
     h, w = image.shape[:2]
 
-    compressor = _get_wechat_compressor(preset)
+    if quality is None and blur_radius is None and subsampling is None:
+        compressor = _get_wechat_compressor(preset)
+    else:
+        from wechat_worst_case_compressor import WeChatWorstCaseCompressor
+        ov = {}
+        if quality is not None:
+            ov['quality'] = int(quality)
+        if blur_radius is not None:
+            ov['blur_radius'] = float(blur_radius)
+        if subsampling is not None:
+            ov['subsampling'] = int(subsampling)
+        compressor = WeChatWorstCaseCompressor.from_preset(
+            preset or 'mainstream_worst', **ov)
     pil_in = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
     pil_out = compressor.compress_to_image(pil_in)
 
@@ -216,6 +231,138 @@ def add_wechat_noise(image, preset=None):
         pil_out = pil_out.resize((w, h), resample)
 
     return cv2.cvtColor(np.array(pil_out.convert('RGB')), cv2.COLOR_RGB2BGR)
+
+
+def add_chroma_texture(image, sigma, corr=3.0, rng=None):
+    """受控色度纹理层 — 只在 G-B 平面调制, 不动亮度。
+
+    为什么需要它
+    ------------
+    实拍里水印(±4 级 G-B)死不死, 由**图案同频段(20px 格)的载体色度纹理**决定,
+    不是色度总量: 同一台相机同一条流水线, VS Code 截图频段 std 5.1 → 水印活,
+    花壁纸+密集图标 17.3 → 水印灭。
+    而 physical_moire 的 sensor_noise_scale / chroma_scale / lattice_visibility_floor
+    全部推不动这个频段 (实测最高只到 3.8~4.4), 合成载体自身也只有 0.3~5.7。
+
+    做法: 相关长度 corr px 的高斯场, G 加 / B 减, 即纯 G-B 调制。
+    标定 (/data1/tmp_vis/tex_layer.py, corr=3.0, 叠在 pimog->wechat 之后):
+        sigma  0 -> 频段std 3.06, 水印残余 +0.039   实拍"活"  (3.1~5.1)
+        sigma  2 -> 频段std 4.96, 水印残余 +0.025   活/死边界
+        sigma  5 -> 频段std ~10,  水印残余 ~+0.017   实拍"临界"(13.8~17.3)
+        sigma  8 -> 频段std 15.60, 水印残余 +0.012   实拍"临界"
+        sigma 12 -> 频段std 23.05, 水印残余 +0.009   已低于可学下限
+    档位上界卡在 sigma<=8: 再往上水印实际不可见, 但标签仍写"有定位块",
+    等于教模型幻觉。
+
+    必须加在压缩**之后** — 加在之前会被 JPEG 抹掉 (sigma=6 前置只剩 10.79, 后置 11.94)。
+
+    非几何, mask/bbox 无需改动。
+    """
+    if sigma <= 0:
+        return image
+    h, w = image.shape[:2]
+    r = np.random if rng is None else rng
+    g = r.randn(h, w).astype(np.float32)
+    if corr > 0:
+        g = cv2.GaussianBlur(g, (0, 0), corr)
+    g = g / max(float(g.std()), 1e-6) * float(sigma)
+    out = image.astype(np.float32)
+    out[:, :, 1] += g
+    out[:, :, 0] -= g
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def add_pimog_noise_strong(image, mask=None, bboxes=None, rng=None,
+                           **overrides):
+    """强化版屏摄 — 关掉"绝对可见性下限"并加大非几何退化。
+
+    preset=screen_capture 的默认值里 preserve_absolute_visibility=True
+    会把内容可见度托在 70%~90% (EXTREME_VISIBILITY_FLOOR_RANGE), 相当于给噪声限幅;
+    真实拍摄没有这回事。同时加大传感器噪声/色度/光学 PSF, 这几项是实拍里
+    真正杀死 ±4 级 G-B 信号的成分 (微信 q60 单独只把残余从 0.20 压到 0.17, 几乎不掉)。
+
+    仍走 _WarpCapturingMoire 的标签同步, 几何 warp 参数不变 (0%~5% 保持原样)。
+    """
+    import torch
+
+    base = _get_moire_sim()
+    ov = dict(preserve_absolute_visibility=False, sensor_noise_scale=2.5,
+              chroma_scale=2.0, optical_psf_scale=2.0)
+    ov.update(overrides)
+    # _WarpCapturingMoire 吃 **overrides 且会抓 content-warp grid, 一次跑完
+    sim = _WarpCapturingMoire(device=base.device, **ov)
+    sim.core.eval()
+
+    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    t = (torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0)
+         .to(device=base.device, dtype=torch.float32).div_(255.0))
+    seed = int(rng.randint(0, 2 ** 31 - 1)) if rng is not None else 777
+    with torch.inference_mode():
+        out = sim(t, generator=torch.Generator(
+            device=base.device).manual_seed(seed))
+    o = (out[0].permute(1, 2, 0).clamp(0, 1).mul(255).round()
+         .to(torch.uint8).cpu().numpy())
+    out_bgr = cv2.cvtColor(o, cv2.COLOR_RGB2BGR)
+
+    if sim.last_grid is not None and (mask is not None or bboxes is not None):
+        mask, bboxes = _sync_labels_to_warp(
+            mask, bboxes, sim.last_grid, image.shape[0], image.shape[1])
+    return out_bgr, mask, bboxes
+
+
+# ── 非几何噪声档位 ────────────────────────────────────────────────
+# 标定: /data1/tmp_vis/tier_calib3.py —— 走 apply_noise_tier 真实代码路径,
+#       4 载体 × 12 种子取中位。**不能用单种子读数**: pimog 的摩尔纹周期
+#       EXTREME_LATTICE_TARGET_ALIAS_PERIOD_RANGE=(5,96)px 逐次随机,
+#       同一档位不同种子的频段std 可差 4 倍。
+# 实拍参考 (vis/real_capture/detect_out/rect, 18 张):
+#     活   残余 +0.034~+0.069  频段std  3.1~ 5.1  信号/纹理 0.72~1.16
+#     临界 残余 +0.004~+0.020  频段std 13.8~17.3  信号/纹理 0.19~0.24
+#     死   残余 -0.048~-0.007  频段std  6.0~ 7.0  信号/纹理 0.47~0.59
+#
+# 档位只覆盖到"临界"下限 (残余 p50 >= 0.007): 更狠会让标签说谎 (图案已不可见)。
+# 每个 clean 样本出 n1..n4 各一份 → 语料各占 25%, 且每个载体在每个严重度上都有配对样本。
+NOISE_TIERS = {
+    'n1': dict(
+        desc='轻   pimog默认 -> w q60',
+        residue='+0.0553', band_std=4.66, share=0.25),
+    'n2': dict(
+        desc='中   pimog默认 -> w q60 -> 纹理 sigma=2',
+        residue='+0.0345', band_std=6.10, share=0.25),
+    'n3': dict(
+        desc='重   pimog强 -> w q46 -> 纹理 sigma=5',
+        residue='+0.0143', band_std=10.46, share=0.25),
+    'n4': dict(
+        desc='极重 pimog极强 -> w q46 x2 -> 纹理 sigma=8',
+        residue='+0.0067', band_std=15.98, share=0.25),
+}
+
+_PIMOG_XSTRONG = dict(sensor_noise_scale=4.0, chroma_scale=3.0,
+                      optical_psf_scale=2.5, ambient_glare_scale=3.0)
+
+
+def apply_noise_tier(image, mask, bboxes, tier, rng):
+    """按非几何噪声档位跑一条完整链路 (相机 → 微信 → 色度纹理)。
+
+    几何项 (透视 0%~5% / content_warp) 一律走原配置, 不在本函数里调。
+    """
+    if tier == 'n1':
+        img, mask, bboxes = add_pimog_noise(image, mask, bboxes, rng=rng)
+        return add_wechat_noise(img), mask, bboxes
+    if tier == 'n2':
+        img, mask, bboxes = add_pimog_noise(image, mask, bboxes, rng=rng)
+        img = add_wechat_noise(img)
+        return add_chroma_texture(img, 2.0, rng=rng), mask, bboxes
+    if tier == 'n3':
+        img, mask, bboxes = add_pimog_noise_strong(image, mask, bboxes, rng=rng)
+        img = add_wechat_noise(img, quality=46)
+        return add_chroma_texture(img, 5.0, rng=rng), mask, bboxes
+    if tier == 'n4':
+        img, mask, bboxes = add_pimog_noise_strong(
+            image, mask, bboxes, rng=rng, **_PIMOG_XSTRONG)
+        img = add_wechat_noise(add_wechat_noise(img, quality=46), quality=46)
+        return add_chroma_texture(img, 8.0, rng=rng), mask, bboxes
+    raise ValueError(f'unknown noise tier: {tier!r}')
 
 
 def add_tile_rotate_crop_noise(image, mask=None, bboxes=None,

@@ -34,6 +34,10 @@ yolo/
 **/unet/.git/
 watermark_locator/v1/vv2_yolov8/ultralytics/
 watermark_locator/v2/vv2_yolov8/ultralytics/
+# v2 自带的第三方依赖 (RT-DETR / yolov10 / yolov12 等, 共 ~100M, 上游各自有仓库)
+watermark_locator/v2/deps/
+# v2 的样例图 (可视化输出, 可由脚本重新生成)
+watermark_locator/v2/sample/
 
 # 探索性调试脚本
 watermark_locator/compare_detail.py
@@ -63,6 +67,13 @@ wandb/
 
 # 可视化输出 (可由脚本重新生成)
 vis/
+docs/figures/
+
+# 课程报告, 不进仓库
+docs/course_report/
+
+# tools/decode 的运行产物 (DX_OUT_DIR 默认落在 cwd, 防止误提交)
+tools/decode/*.json
 
 # 模型权重 (体积大, 训练产物)
 *.pt

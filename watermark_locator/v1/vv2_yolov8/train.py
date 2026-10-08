@@ -30,7 +30,7 @@ import numpy as np
 import yaml
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'dataset'))
-from multi_dataset import discover_datasets, _list_images
+from multi_dataset import discover_datasets, _list_images, fit_image_and_targets, SCALE_MODE
 
 from ultralytics import YOLO
 
@@ -67,7 +67,8 @@ def _merge_stamp(data_root, image_size, train_length=0, val_length=0):
                 n += len(_list_images(d))
     return (f"{os.path.abspath(data_root)}|{image_size[0]}x{image_size[1]}"
             f"|{len(datasets)}ds|{n}img"
-            f"|tr{int(train_length or 0)}|va{int(val_length or 0)}")
+            f"|tr{int(train_length or 0)}|va{int(val_length or 0)}"
+            f"|sm{SCALE_MODE}")
 
 
 def build_yolo_dataset(data_root, output_dir, image_size=(1080, 1920), force=False,
@@ -131,25 +132,33 @@ def build_yolo_dataset(data_root, output_dir, image_size=(1080, 1920), force=Fal
             img = cv2.imread(os.path.join(images_dir, fname))
             if img is None:
                 continue
-            h, w = image_size
-            if img.shape[:2] != (h, w):
-                img = cv2.resize(img, (w, h))
-            cv2.imwrite(os.path.join(output_dir, 'images', split, out_stem + '.png'), img)
 
-            # 复制/转换标签
+            # 标签: 读成 [[cls, cx, cy, w, h]] (归一化于**输入图尺寸**)
+            labels = []
             lbl_src = None
             if labels_dir:
-                for ext in ('.txt',):
-                    path = os.path.join(labels_dir, stem + ext)
-                    if os.path.exists(path):
-                        lbl_src = path
-                        break
+                path = os.path.join(labels_dir, stem + '.txt')
+                if os.path.exists(path):
+                    lbl_src = path
+                    with open(path) as f:
+                        for line in f:
+                            p = line.split()
+                            if len(p) >= 5:
+                                labels.append([int(float(p[0]))] + [float(x) for x in p[1:5]])
+
+            # scale_mode='pad_native' 时按固定比例缩放 + pad, 定位块绝对尺度不变,
+            # 且标签随之重归一化到 image_size; 'resize' 时旧行为, 标签坐标不变。
+            img, _, labels = fit_image_and_targets(
+                img, None, labels, image_size, SCALE_MODE)
+            cv2.imwrite(os.path.join(output_dir, 'images', split, out_stem + '.png'), img)
 
             lbl_dst = os.path.join(output_dir, 'labels', split, out_stem + '.txt')
             rec = per_ds.setdefault(ds_name, [0, 0])
             rec[0] += 1
-            if lbl_src and os.path.getsize(lbl_src) > 0:
-                shutil.copy2(lbl_src, lbl_dst)
+            if labels:
+                with open(lbl_dst, 'w') as f:
+                    for cls, cx, cy, bw, bh in labels:
+                        f.write(f'{cls} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n')
             else:
                 # 无标签时写空文件 (负样本)
                 with open(lbl_dst, 'w') as f:
@@ -185,12 +194,31 @@ def main():
     parser.add_argument('--config', type=str, required=True, help='配置文件路径')
     parser.add_argument('--device', type=str, default=None, help='GPU编号(覆盖config)')
     parser.add_argument('--force_rebuild', action='store_true', help='强制重建合并数据集')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='断点续训: 指向 runs/.../weights/last.pt (覆盖 config.resume)')
+    parser.add_argument('--batch', type=int, default=None,
+                        help='batch_size (覆盖 config)。续训时也可改 —— ultralytics '
+                             'check_resume 白名单里就允许 batch/device/save_dir 在断点上调整')
+    parser.add_argument('--workers', type=int, default=None,
+                        help='DataLoader worker 数 (覆盖 config)。/data1 这类慢盘上 worker '
+                             '太少会饿死 GPU; 续训时同样可改 (在 check_resume 白名单内)')
     args = parser.parse_args()
 
     with open(args.config, 'r', encoding='utf-8') as f:
         cfg = yaml.safe_load(f)
 
     device = args.device or cfg.get('device', '0')
+    # 断点续训: 传 last.pt 路径。ultralytics 会从 ckpt 恢复 epoch/优化器/AMP/EMA,
+    # 并把 batch/device 等白名单参数覆盖到恢复后的 args 上 (见 engine/trainer.py
+    # check_resume)。lr0/optimizer **不在**白名单内, 续训沿用检查点里存的调度, 不会被改。
+    resume_path = args.resume or cfg.get('resume') or None
+    if resume_path and not os.path.exists(resume_path):
+        raise FileNotFoundError(f'resume checkpoint not found: {resume_path}')
+    batch_size = args.batch if args.batch is not None else int(cfg.get('batch_size', 8))
+    # 慢盘 (网络盘/机械盘) 上 worker 少会饿死 GPU。默认按 CPU 核数取, 上限 16:
+    # 再高只是和自己抢同一块盘的寻道。
+    workers = args.workers if args.workers is not None else int(
+        cfg.get('workers', min(16, max(4, (os.cpu_count() or 8) // 4))))
     output_dir = cfg.get('output_dir', f'output/v1_vv2_{datetime.now().strftime("%Y%m%d_%H%M%S")}')
     os.makedirs(output_dir, exist_ok=True)
     with open(os.path.join(output_dir, 'config.yaml'), 'w', encoding='utf-8') as f:
@@ -249,21 +277,26 @@ def main():
             seed=seed + si * 10)
 
         # ── 初始化: 阶段1用 base/finetune 权重, 之后接上一阶段 best.pt ──
-        init = prev_best or finetune_cfg.get('weight_path') or model_name
+        # 断点续训时直接吃 last.pt —— ultralytics 的 check_resume 也会把 args.model
+        # 指回这个文件, 提前对齐可省一次无谓的权重加载。
+        init = resume_path or prev_best or finetune_cfg.get('weight_path') or model_name
         if not (init and os.path.exists(init)):
             init = model_name
         logger.info(f"Loading model: {init}")
+        if resume_path:
+            logger.info(f"RESUME from {resume_path}  (batch={batch_size}  workers={workers}  device={device})")
         model = YOLO(init)
 
         run_name = f'yolo_{tag}'
         # optimizer=auto 会自行挑 lr 并**忽略 lr0** —— 配置里的 lr 就白写了。
         # 显式指定优化器 (默认 SGD, 即 lr0=0.01 的 YOLO 惯例) 才吃 stages 里的 lr。
         optimizer = stage.get('optimizer', cfg.get('optimizer', 'SGD'))
-        model.train(
+        train_kwargs = dict(
             data=yaml_path,
             epochs=epochs,
             imgsz=cfg.get('imgsz', 640),
-            batch=cfg.get('batch_size', 8),
+            batch=batch_size,
+            workers=workers,
             lr0=lr,
             optimizer=optimizer,
             device=device,
@@ -276,6 +309,26 @@ def main():
             seed=seed,
             verbose=True,
         )
+        # channels_last: NHWC 内存布局, Ada/Ampere 上卷积免费提速。
+        # 实测 batch64 下 GPU 步 85ms -> 52ms (快 37%), 显存几乎不变。
+        if cfg.get('channels_last'):
+            train_kwargs['channels_last'] = bool(cfg['channels_last'])
+        if resume_path:
+            # 仅首阶段支持续训: 后续阶段的权重链靠 prev_best, 语义不同
+            assert si == 0, 'resume 仅支持单阶段/首阶段'
+            train_kwargs['resume'] = resume_path
+
+        # 增广透传: config 的 `augment: {scale: ..., mosaic: ...}` 逐项覆盖 ultralytics
+        # 默认值 (不给则完全吃默认: scale=0.5 -> 0.5~1.5x, mosaic=1.0)。
+        #   scale 传 float  -> 增益 1±scale
+        #   scale 传 (min,max) 元组 -> **绝对倍率** 区间
+        # 裁剪集 + pad_native 把定位块钉死在 53px, 尺度覆盖只能靠这里放开。
+        aug = {**(cfg.get('augment') or {}), **(stage.get('augment') or {})}
+        for _k, _v in aug.items():
+            train_kwargs[_k] = _v
+        if aug:
+            logger.info(f"  augment overrides: {aug}")
+        model.train(**train_kwargs)
 
         # ultralytics 会把相对 project 挂到 runs/detect/ 下, 自行拼 output_dir/run_name
         # 找不到 best.pt, 阶段间权重链就断了 —— 以 trainer 的实际 save_dir 为准

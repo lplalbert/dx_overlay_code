@@ -1,0 +1,46 @@
+# v1-vv2 v3: 在 3-noise best 权重基础上, 用**裁剪增广集**(clean + 3 噪声, 四变体)续训 100 轮
+#
+# 数据: /data1/lpl/datasets_labeled_3noise_cropped/all
+#   16916 张 = clean 4229 + noisy 12687, 每张是原图的 25%-70% 面积随机裁剪
+#   目的: 打破"定位块恒在 4x6 网格固定坐标"的位置先验 (全图 F1 0.997 -> 裁剪 0.79)
+#   残缺定位块: 可见面积 >= 原框 50% 且可见宽高 >= 40px 则保留裁剪框, 否则连 mask 一起抛弃
+#
+# ★ 必须配 SCALE_MODE=pad_native 环境变量 ★
+#   默认 resize 会把裁剪图拉伸到 1920x1080 再 letterbox 到 640, 定位块表观尺度
+#   变成 ~103px (部署 native 口径下恒为 53px)。pad_native 原生分辨率落位 pad 到
+#   1920x1080, letterbox 因子恒为 1/3, 尺度严格不变。
+#   训练: SCALE_MODE=pad_native python train.py --config config_v3.yaml
+
+stages:
+  - name: crop_aug_finetune
+    data_root: /data1/lpl/datasets_labeled_3noise_cropped/all
+    epochs: 100
+    lr: 0.005
+    patience: 0          # 0 = 关闭早停, 保证跑满 100 轮
+
+data_root: /data1/lpl/datasets_labeled_3noise_cropped/all
+
+image_height: 1080
+image_width: 1920
+
+output_dir: output/v1_vv2_yolo_v3
+
+# 从 3-noise 续训的 best 权重起步 (mAP@50-95 0.9904)
+finetune:
+  weight_path: /data1/lpl/dx_overlay_code/runs/detect/output/v1_vv2_yolo_v2/yolo_noisy_3noise_finetune/weights/best.pt
+
+model: yolov8n.pt
+imgsz: 640
+
+# GPU 0 被上一轮 3noise 续训占着, 这轮走空闲的 GPU 1
+device: "1"
+
+batch_size: 16
+lr: 0.005
+epochs: 100
+patience: 0
+save_every: 10
+seed: 42
+
+train_length: 0
+val_length: 0

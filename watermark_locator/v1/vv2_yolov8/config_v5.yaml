@@ -1,0 +1,102 @@
+# v1-vv2 v5: 在 v4 权重基础上, 用**标定过的四档非几何噪声**微调
+#
+# 为什么要这一版
+# --------------
+# v4 在 18 张实拍上的召回 52.8% (v3 72.2%), 但尺度带测试显示这不是尺度问题:
+#     1.0x  v3 98.6% / v4 98.6%  (并列)
+#     2.0x  v3  6.7% / v4 74.2%  (v4 大胜)
+# 真正的差是**退化域差**: 实拍 18 张里 12 张的水印残余已在噪声底 ——
+# 水印(±4 级 G-B)被真实拍照+微信链路抹掉了, 训练集里从来没造出过这种退化强度。
+#
+# 两个量化出来的缺口 (标定脚本见下):
+#   A. 噪声太温柔: 训练现状 wechat q60 后残余 +0.27, 实拍只有 -0.05~+0.07。
+#      微信 JPEG **根本抹不掉** ±4 (我一度以为 q60 色度量化步长 79 会抹掉, 实测错了)。
+#      真正杀死它的是 physical_moire 的屏摄链 (摩尔纹+光学 PSF+传感器+ISP),
+#      单独 pimog 就把残余压到 +0.024 —— 已在实拍区间。
+#   B. 图案频段纹理太窄: 合成 2.4~4.4, 实拍 3.1~17.3。
+#      频段(20px 格)上的**载体色度纹理**才是判别量, 不是色度总量 ——
+#      同一台相机同一条流水线, VS Code 截图频段 std 5.1 -> 水印活,
+#      花壁纸+密集图标 17.3 -> 水印灭。
+#      pimog 的 sensor_noise/chroma/lattice 旋钮推不动这个频段 (实测顶到 4.4),
+#      所以加了一层受控色度纹理 (generate_dataset.add_chroma_texture)。
+#
+# 数据: /data1/lpl/datasets_labeled_4tier/noisy   n1..n4 各 25%
+#   每个 clean 样本出 4 个档位变体 -> 每个载体在每个严重度上都有配对样本
+#   标定: /data1/tmp_vis/tier_calib3.py (走 apply_noise_tier 真实路径,
+#         4 载体 × 12 种子取中位。**不能用单种子读数**: pimog 摩尔纹周期
+#         EXTREME_LATTICE_TARGET_ALIAS_PERIOD_RANGE=(5,96)px 逐次随机,
+#         同一档位不同种子的频段std 可差 4 倍。)
+#
+#     档   残余p50   频段std   信号/纹理   对齐实拍
+#     n1   +0.0553      4.66       0.62   活   (+0.034~0.069 / 3.1~5.1)
+#     n2   +0.0345      6.10       0.47   活↔死边界 (std 6.0~7.0)
+#     n3   +0.0143     10.46       0.28   临界 (+0.004~0.020)
+#     n4   +0.0067     15.98       0.18   临界 (std 13.8~17.3 / 0.19~0.24)
+#
+#   档位上界卡在 n4 (残余 p50 = 0.007): 再狠标签就说谎了 —— 图案实际已不可见,
+#   但标签还写着"这里有定位块", 那是在教模型幻觉。实拍"死"档 (残余 -0.05~-0.007)
+#   故意不覆盖。
+#
+# 只动非几何噪声
+#   透视 / content_warp 一律走原配置 (0%~5%), 不在本版调整范围内。
+
+stages:
+  - name: noise_realism_finetune
+    tag: noise_realism_finetune
+    data_root: /data1/lpl/datasets_labeled_4tier/noisy
+    epochs: 60
+    lr: 0.002
+    patience: 0
+    save_every: 10
+
+data_root: /data1/lpl/datasets_labeled_4tier/noisy
+
+image_height: 1080
+image_width: 1920
+
+# ★ 独立目录: 权重与 v2/v3/v4 分开保存 ★
+output_dir: output/v1_vv2_yolo_v5
+
+# 从 v4 最终权重续训 (不是 v3)
+#   v4 的 scale=(0.4,2.2) 已经把尺度工作带撑到 0.4~2.2x, 这一版不碰尺度。
+finetune:
+  weight_path: /data1/lpl/dx_overlay_code/runs/detect/output/v1_vv2_yolo_v4/yolo_scale_aug_finetune/weights/best.pt
+
+model: yolov8n.pt
+imgsz: 640
+
+# 单卡。GPU0 现已空出 (zqy 的任务退了)。
+device: "0"
+
+# batch 16 -> 64 只是墙钟加速, 有效 batch 恒 64 (ultralytics nbs=64 自动梯度累积),
+# 所以 lr 不跟着放大。见 wm-train-nbs-effective-batch。
+batch_size: 64
+channels_last: true
+
+# 域适配微调, 比 v4 的 0.003 再降 —— 免得把 v4 已有的尺度均衡冲掉。
+# ckpt_sensitivity_curve 显示 v4 从 v3 接上后灵敏度是**一路掉**的
+# (ep50 是最好点, 之后 60~90 全不如), 所以这一版更要小步慢走、少跑轮次。
+lr: 0.002
+
+epochs: 60
+patience: 0
+
+# ★ 保存节奏加密, 且**不要拿 val fitness 选 best** ★
+# v4 的 best.pt 是按 val fitness 选的, 而部署点是实拍 —— 选错了指标。
+# 这一版 save_every=10, 训完把 epoch*.pt 全部拿到 18 张实拍上跑一遍,
+# 用实拍召回选最终权重 (参考 ckpt_sensitivity_curve.py 的做法)。
+save_every: 10
+seed: 42
+
+workers: 32
+
+train_length: 0
+val_length: 0
+
+# ── 增广: 沿用 v4 的尺度带, 一字不改 ──
+# 本版唯一的自变量是噪声, 尺度保持恒定才能把功劳/锅归到噪声上。
+augment:
+  scale: [0.4, 2.2]
+  mosaic: 0.7          # 30% 不拼 mosaic, 保留整幅样本 (贴近部署的满幅输入)
+  translate: 0.15
+  fliplr: 0.5

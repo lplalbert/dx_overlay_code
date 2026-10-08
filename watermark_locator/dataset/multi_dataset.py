@@ -124,6 +124,84 @@ def _list_images(directory):
     ])
 
 
+SCREEN_W, SCREEN_H = 1920, 1080
+
+# 缩放口径:
+#   resize      旧行为 —— 拉伸到 image_size。**会改变定位块的表观尺度**:
+#               裁剪图典型宽 ~991px, 拉到 960x540 后定位块 160*(960/991)≈155px,
+#               而部署 (native) 口径下恒为 80px, 尺度失配 ~2x。
+#   pad_native  按 image_size[1]/SCREEN_W 固定比例缩放, 再 pad 到 image_size。
+#               定位块绝对尺度不变, 与 docs/make_crop_eval.py 的 native 推理
+#               (裁剪图 x0.5 / x1/3 直接前向) 严格对齐。
+#               **满幅 1920x1080 输入下两种模式结果完全一致** (缩放即为恒等/0.5,
+#               无 padding), 所以对旧数据集是无损超集。
+# 默认保持 'resize' 不动既有训练; 训练裁剪增广集时切 'pad_native'。
+SCALE_MODE = os.environ.get('SCALE_MODE', 'resize')
+
+
+def fit_image_and_targets(img, mask, labels, image_size, scale_mode='resize',
+                          random_place=True):
+    """把输入装进 image_size=(H, W), 返回 (img, mask, labels_new)。
+
+    labels: [[cls, cx, cy, w, h]] 归一化于**输入图尺寸**。
+    pad_native 下会重归一化到 image_size (含落位偏移); resize 下不变
+    (各向拉伸到同一目标框时归一化坐标天然保持)。
+
+    random_place: pad_native 的落位是否随机。训练用 True (每轮打散位置,
+                  进一步破除位置先验); 验证用 False (固定贴左上角),
+                  否则 val 指标每轮抖动, 早停/选最优不可靠。
+    """
+    h, w = image_size
+    in_h, in_w = img.shape[:2]
+
+    if scale_mode != 'pad_native' or (in_h, in_w) == (h, w):
+        if img.shape[:2] != (h, w):
+            img = cv2.resize(img, (w, h))
+        if mask is not None and mask.shape[:2] != (h, w):
+            mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+        return img, mask, labels
+
+    s = w / float(SCREEN_W)                      # 与部署口径同因子 (vv1 0.5 / vv2 1.0)
+    sw, sh = int(round(in_w * s)), int(round(in_h * s))
+    if sw > w or sh > h:                         # 兜底: 装不下时退回拉伸
+        return fit_image_and_targets(img, mask, labels, image_size, 'resize')
+
+    if (sw, sh) != (in_w, in_h):
+        img = cv2.resize(img, (sw, sh))
+        if mask is not None:
+            mask = cv2.resize(mask, (sw, sh), interpolation=cv2.INTER_NEAREST)
+    else:
+        img = img.copy()
+        if mask is not None:
+            mask = mask.copy()
+
+    # 落位: 训练随机 (打散位置先验), 验证固定 (保证 val 可复现)
+    if random_place:
+        px = int(np.random.randint(0, w - sw + 1))
+        py = int(np.random.randint(0, h - sh + 1))
+    else:
+        px, py = 0, 0
+
+    canvas = cv2.copyMakeBorder(img, py, h - sh - py, px, w - sw - px,
+                                cv2.BORDER_REFLECT_101)
+    if mask is not None:
+        m = np.zeros((h, w), mask.dtype)
+        m[py:py + sh, px:px + sw] = mask
+        mask = m
+
+    new_labels = []
+    for row in (labels or []):
+        cls, cx, cy, bw, bh = row
+        new_labels.append([
+            cls,
+            (px + cx * in_w * s) / w,
+            (py + cy * in_h * s) / h,
+            (bw * in_w * s) / w,
+            (bh * in_h * s) / h,
+        ])
+    return canvas, mask, new_labels
+
+
 class LocatorSegmentationDataset(Dataset):
     """v1-vv1: 3 通道 BGR → mask 分割数据集 (单个数据源)。
 
@@ -131,10 +209,13 @@ class LocatorSegmentationDataset(Dataset):
     G/R 恒 255), 所以 channel 0 就是水印所在通道。**不要**再抽 Cb。
     """
 
-    def __init__(self, images_dir, masks_dir, image_size=(1080, 1920)):
+    def __init__(self, images_dir, masks_dir, image_size=(1080, 1920),
+                 scale_mode=None, random_place=True):
         self.images_dir = images_dir
         self.masks_dir = masks_dir
         self.image_size = image_size
+        self.scale_mode = scale_mode or SCALE_MODE
+        self.random_place = random_place
         self.files = _list_images(images_dir)
         if masks_dir is None and self.files:
             logger.warning(f"  SegmentationDataset: no masks dir for {images_dir} "
@@ -155,12 +236,10 @@ class LocatorSegmentationDataset(Dataset):
         if mask is None:
             mask = np.zeros(img.shape[:2], dtype=np.uint8)
 
-        # 统一尺寸
-        h, w = self.image_size
-        if img.shape[:2] != (h, w):
-            img = cv2.resize(img, (w, h))
-        if mask.shape[:2] != (h, w):
-            mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+        # 统一尺寸 (scale_mode 见 fit_image_and_targets)
+        img, mask, _ = fit_image_and_targets(
+            img, mask, None, self.image_size, self.scale_mode,
+            random_place=self.random_place)
 
         # 3 通道 BGR (channel 0 = B = 水印信号所在通道)
         if img.ndim == 2:
@@ -193,10 +272,13 @@ class LocatorDetectionDataset(Dataset):
         [class_id, cx, cy, w, h] 归一化坐标
     """
 
-    def __init__(self, images_dir, labels_dir, image_size=(1080, 1920)):
+    def __init__(self, images_dir, labels_dir, image_size=(1080, 1920),
+                 scale_mode=None, random_place=True):
         self.images_dir = images_dir
         self.labels_dir = labels_dir
         self.image_size = image_size
+        self.scale_mode = scale_mode or SCALE_MODE
+        self.random_place = random_place
         self.files = _list_images(images_dir)
         if labels_dir is None and self.files:
             logger.warning(f"  DetectionDataset: no labels dir for {images_dir} "
@@ -215,9 +297,9 @@ class LocatorDetectionDataset(Dataset):
         # 加载 YOLO labels
         labels = self._load_labels(name)
 
-        h, w = self.image_size
-        if img.shape[:2] != (h, w):
-            img = cv2.resize(img, (w, h))
+        img, _, labels = fit_image_and_targets(
+            img, None, labels, self.image_size, self.scale_mode,
+            random_place=self.random_place)
 
         # 3 通道 BGR (channel 0 = B = 水印信号所在通道); 不要抽 Cb
         if img.ndim == 2:
@@ -244,7 +326,7 @@ class LocatorDetectionDataset(Dataset):
 
 
 def build_multi_dataset(root_dir, split='train', task='segmentation',
-                        image_size=(1080, 1920)):
+                        image_size=(1080, 1920), scale_mode=None):
     """
     从 root_dir 下所有数据集构建 ConcatDataset。
 
@@ -253,10 +335,16 @@ def build_multi_dataset(root_dir, split='train', task='segmentation',
         split: 'train' 或 'val'
         task: 'segmentation' (vv1) 或 'detection' (vv2)
         image_size: (H, W)
+        scale_mode: 'resize' | 'pad_native'; None 则取环境变量 SCALE_MODE
+                    (默认 'resize')。训练**裁剪增广集**时必须用 'pad_native',
+                    否则定位块表观尺度被拉大 ~2x, 与部署口径失配。
 
     Returns:
         ConcatDataset 或单个 Dataset
     """
+    scale_mode = scale_mode or SCALE_MODE
+    # val 必须确定性, 否则 val 指标每轮抖动、早停/选最优不可靠
+    random_place = (split == 'train')
     datasets_info = discover_datasets(root_dir)
     if not datasets_info:
         raise RuntimeError(f"No valid datasets found in {root_dir}")
@@ -270,11 +358,15 @@ def build_multi_dataset(root_dir, split='train', task='segmentation',
         if task == 'segmentation':
             # vv1: masks/ (灰度 PNG) 优先; 兼容旧字段 labels/ 指向 mask 的情况
             ann_dir = info.get(f'{split}_masks') or info.get(f'{split}_labels')
-            ds = LocatorSegmentationDataset(images_dir, ann_dir, image_size)
+            ds = LocatorSegmentationDataset(images_dir, ann_dir, image_size,
+                                            scale_mode=scale_mode,
+                                            random_place=random_place)
         elif task == 'detection':
             # vv2: labels/ (YOLO txt) 优先
             ann_dir = info.get(f'{split}_labels')
-            ds = LocatorDetectionDataset(images_dir, ann_dir, image_size)
+            ds = LocatorDetectionDataset(images_dir, ann_dir, image_size,
+                                         scale_mode=scale_mode,
+                                         random_place=random_place)
         else:
             raise ValueError(f"Unknown task: {task}")
 
